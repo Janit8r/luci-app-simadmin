@@ -149,7 +149,18 @@ pub fn collect_cgcontrdp_pcscf(response: &str) -> Vec<IpAddr> {
         };
         let fields: Vec<&str> = rest.split(',').map(str::trim).collect();
         for f in fields.iter().skip(7) {
-            if let Some(a) = parse_at_addr(f.trim_matches('"')) {
+            let f = f.trim().trim_matches('"');
+            if f.is_empty() {
+                continue;
+            }
+            // 联通实测：默认承载那行的第 8 字段塞的是「DNS2 + 空格 + IPv6 尾串」
+            // （例：`221.5.88.88 8.136.153.0.0.136.153.0.0.0.0.0.0.0.8.254`）。
+            // 这种带空格的字段按点号切完恰好凑出 16 组，会被误当成 IPv6 P-CSCF。
+            // 真正的 P-CSCF 字段只有一个地址，不会含空白。
+            if f.contains(char::is_whitespace) {
+                continue;
+            }
+            if let Some(a) = parse_at_addr(f) {
                 if !out.contains(&a) {
                     out.push(a);
                 }
@@ -383,14 +394,23 @@ mod tests {
 
     #[test]
     fn collects_pcscf_from_every_cgcontrdp_line() {
-        // 第一行是默认承载（没有 P-CSCF 字段），第二行才是 IMS 上下文。
+        // 第一行是默认承载，用的是联通实测的真实返回：第 8 字段是
+        // 「DNS2 + 空格 + IPv6 尾串」，解析不出 P-CSCF。
+        // 第二行才是 IMS 上下文，第 8 字段才是真正的 P-CSCF。
         let resp = "\
-+CGCONTRDP: 1,5,3gnet,10.230.169.144,36.8.132.86.4.22.253.204.0.0.0.0.0.0.0.1, 128.0.0.0.0.0.0.0.0.0.0.0.0.0.2.0,120.80.80.80,221.5.88.88\r
++CGCONTRDP: 1,5,3gnet,10.230.169.144,36.8.132.86.4.22.253.204.0.0.0.0.0.0.0.1, 128.0.0.0.0.0.0.0.0.0.0.0.0.0.2.0,120.80.80.80 8.136.136.0.0.136.136.0.0.0.0.0.0.0.8.36,221.5.88.88 8.136.153.0.0.136.153.0.0.0.0.0.0.0.8.254\r
 +CGCONTRDP: 3,6,\"ims.epc.mnc001.mcc460.gprs\",\"36.8.133.86.162.49.16.78.0.0.0.0.0.0.0.1\",\"36.8.133.86.162.49.16.78.217.240.204.160.55.10.58.159\",\"36.8.136.136.0.0.136.136.0.0.0.0.0.0.0.8\",\"\",\"36.8.129.66.96.1.0.1.0.0.0.0.0.0.0.0\"\r
 OK";
         let list = collect_cgcontrdp_pcscf(resp);
-        assert_eq!(list.len(), 1);
+        assert_eq!(list.len(), 1, "实际: {list:?}");
         assert_eq!(list[0], "2408:8142:6001:1::".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn dns_field_with_trailing_ipv6_is_not_a_pcscf() {
+        // 只给默认承载那一行：绝不能凭空造出一个 IPv6 地址来。
+        let resp = "+CGCONTRDP: 1,5,3gnet,10.230.169.144,36.8.132.86.4.22.253.204.0.0.0.0.0.0.0.1, 128.0.0.0.0.0.0.0.0.0.0.0.0.0.2.0,120.80.80.80 8.136.136.0.0.136.136.0.0.0.0.0.0.0.8.36,221.5.88.88 8.136.153.0.0.136.153.0.0.0.0.0.0.0.8.254";
+        assert!(collect_cgcontrdp_pcscf(resp).is_empty());
     }
 
     #[test]
