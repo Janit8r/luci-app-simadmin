@@ -1,34 +1,30 @@
 # Rust 构建产物
+backend/target/
 target/
-SimAdmin-main/target/
-SimAdmin-main/backend/target/
 .cargo-target*/
-*.rs.bk
 
-# 参考实现（已整包并入 SimAdmin-main/backend/src/volte，避免两份分叉）
-/ims/
+# 前端依赖和构建文件
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+# 保留 pnpm-lock.yaml，移除其他包管理器的 lockfile
+frontend/yarn.lock
+frontend/package-lock.json
 
-# README 用的截图（16MB PNG，与构建无关）
-SimAdmin-main/static/
-
-# 前端依赖
-SimAdmin-main/frontend/node_modules/
-SimAdmin-main/frontend/dist/
-SimAdmin-main/frontend/.vite/
-
-# 构建/发布产物
-release/
-*.bin
-*.ipk
-temp/
-.tmp/
-
-# 编辑器与系统
+# macOS
 .DS_Store
-Thumbs.db
-*.swp
-.vscode/
-.idea/
 
-# 本地工作笔记（不属于项目产物）
-.workbuddy-ai/
+# 构建产物
+*.bin
+
+# Release 包
+release/
+
+# 临时目录
+temp/
+.tmp
+test/
+tests/
+build/
+TODO.md
+TODO-VOLTE.md
