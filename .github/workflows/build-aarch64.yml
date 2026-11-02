@@ -100,7 +100,15 @@ jobs:
           ls -lh out/simadmin
           # 直接覆盖包里的旧二进制，方便整包取用
           cp out/simadmin luci-app-simadmin/root/opt/simadmin/simadmin
-          chmod 0755 luci-app-simadmin/root/opt/simadmin/simadmin
+          # 整包 tar 是直接摊到设备上的，权限不能依赖 checkout 出来的 git 模式
+          chmod 0755 \
+            luci-app-simadmin/root/opt/simadmin/simadmin \
+            luci-app-simadmin/root/opt/simadmin/start.sh \
+            luci-app-simadmin/root/etc/init.d/* \
+            luci-app-simadmin/root/etc/uci-defaults/* \
+            luci-app-simadmin/root/usr/bin/* \
+            luci-app-simadmin/root/usr/sbin/* \
+            luci-app-simadmin/root/usr/libexec/simadmin/*
           tar -czf out/luci-app-simadmin.tar.gz -C luci-app-simadmin .
 
       - name: Upload binary
