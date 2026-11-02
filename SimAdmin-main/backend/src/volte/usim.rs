@@ -13,7 +13,7 @@ use std::time::Duration;
 use simadmin_device_runtime::qmi_uim::execute_usim_authenticate_via_proxy;
 
 use super::aka::{AkaChallenge, AkaResult};
-use super::qmi_raw::{Qmux, SVC_UIM};
+use super::qmi_raw::{find_qmi_device, Qmux, SVC_UIM};
 use super::uim;
 
 /// 逻辑通道槽位（单卡设备固定 1）。
@@ -144,16 +144,6 @@ fn open_channel(qmux: &mut Qmux, client: u8, aid: &[u8]) -> Result<u8, String> {
             .uim_open_channel(client, USIM_SLOT, aid, true)
             .map_err(|second| format!("open-channel: {first}; wide: {second}")),
     }
-}
-
-fn find_qmi_device() -> Option<String> {
-    for index in 0..4 {
-        let path = format!("/dev/cdc-wdm{index}");
-        if std::path::Path::new(&path).exists() {
-            return Some(path);
-        }
-    }
-    None
 }
 
 // ---------------------------------------------------------------------------

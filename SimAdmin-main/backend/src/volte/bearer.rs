@@ -13,7 +13,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::process::Command;
 use std::time::Duration;
 
-use super::qmi_raw::Qmux;
+use super::qmi_raw::{find_qmi_device, Qmux};
 use super::{err, ip_bin, pcscf};
 
 /// 承载建立参数。
@@ -489,7 +489,10 @@ fn raw_qmux_bring_up(cfg: &BearerConfig) -> Result<BearerRaw, String> {
         Ok(BearerRaw {
             local: Some(local),
             prefix: settings.prefix,
-            gateway: settings.gateway.map(IpAddr::V6),
+            gateway: settings
+                .gateway
+                .map(IpAddr::V6)
+                .or_else(|| settings.ipv4_gateway.map(IpAddr::V4)),
             pcscf: Vec::new(),
             pcscf_hint: Vec::new(),
         })
@@ -505,16 +508,6 @@ fn raw_qmux_bring_up(cfg: &BearerConfig) -> Result<BearerRaw, String> {
 // 接口探测与地址配置
 // ---------------------------------------------------------------------------
 
-fn find_qmi_device() -> Option<String> {
-    for index in 0..4 {
-        let path = format!("/dev/cdc-wdm{index}");
-        if std::path::Path::new(&path).exists() {
-            return Some(path);
-        }
-    }
-    None
-}
-
 /// 选择承载对应的网络接口。
 ///
 /// 优先：显式配置 → 已带该地址的接口 → 名字带 mux 后缀（`wwan0.2`）→ wwan/rmnet 首个。
@@ -529,6 +522,13 @@ pub fn detect_interface(cfg: &BearerConfig, local: IpAddr) -> Result<String, Str
     }
 
     if let Some(found) = candidates.iter().find(|iface| interface_has_address(iface, local)) {
+        return Ok(found.clone());
+    }
+
+    // 内嵌 modem（bam-dmux）把 mux N 直接暴露成 `wwanN`，不是 `wwan0.N`。
+    // 地址还没配上时这是唯一能选中正确数据口的线索：mux=2 → wwan2。
+    let bam_dmux = format!("wwan{}", cfg.mux);
+    if let Some(found) = candidates.iter().find(|iface| **iface == bam_dmux) {
         return Ok(found.clone());
     }
 

@@ -533,7 +533,7 @@ fn wait_readable(fd: i32, timeout: Duration) -> Result<(), String> {
 ///
 /// 设备实测（ImmortalWrt 7.3 / msm8916 / bam-dmux）只有 `wwan0qmi0`，
 /// 早期只扫 `cdc-wdm*` 会直接报 `volte_qmi_device_missing`。
-fn find_qmi_device() -> Option<String> {
+pub fn find_qmi_device() -> Option<String> {
     for index in 0..4 {
         let path = format!("/dev/cdc-wdm{index}");
         if std::path::Path::new(&path).exists() {
@@ -577,6 +577,7 @@ pub struct WdsSettings {
     pub gateway: Option<std::net::Ipv6Addr>,
     pub dns: Vec<std::net::Ipv6Addr>,
     pub ipv4: Option<std::net::Ipv4Addr>,
+    pub ipv4_gateway: Option<std::net::Ipv4Addr>,
 }
 
 /// 解析 0x002D 响应。TLV 布局（libqmi 权威）：
@@ -608,7 +609,17 @@ pub fn parse_wds_settings(tlvs: &[(u8, Vec<u8>)]) -> WdsSettings {
                 }
             }
             0x1e if v.len() >= 4 => {
-                out.ipv4 = Some(std::net::Ipv4Addr::new(v[0], v[1], v[2], v[3]));
+                // QMI 的 IPv4 字段是小端存放（libqmi 读出来要 htonl 再转）。
+                // 直接按 v[0..4] 拼会得到 124.149.140.10 这种反序地址，
+                // 设备实测踩过：raw QMUX 路径拿到反序地址后接口配不上、P-CSCF 全失败。
+                out.ipv4 = Some(std::net::Ipv4Addr::new(v[3], v[2], v[1], v[0]));
+                if v.len() >= 5 && v[4] <= 32 {
+                    out.prefix = v[4];
+                }
+                if v.len() >= 9 && v[5..9] != [0, 0, 0, 0] {
+                    out.ipv4_gateway =
+                        Some(std::net::Ipv4Addr::new(v[8], v[7], v[6], v[5]));
+                }
             }
             _ => {}
         }
