@@ -135,6 +135,30 @@ pub fn parse_cgcontrdp(response: &str) -> Result<(IpAddr, Option<IpAddr>, Vec<Ip
     Err(err::CGCONTRDP_IPV6_MISSING.to_string())
 }
 
+/// 从 `+CGCONTRDP` 的**所有**行里收集 P-CSCF（第 8 字段起）。
+///
+/// 与 `parse_cgcontrdp` 的区别：那个只看第一行、返回本机地址与网关；
+/// 这里只关心 P-CSCF，而且要把每一条上下文都翻一遍——IMS 上下文不一定排在
+/// 第一行（实测默认承载 cid 1 永远排在最前）。
+pub fn collect_cgcontrdp_pcscf(response: &str) -> Vec<IpAddr> {
+    let mut out: Vec<IpAddr> = Vec::new();
+    for line in response.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("+CGCONTRDP:") else {
+            continue;
+        };
+        let fields: Vec<&str> = rest.split(',').map(str::trim).collect();
+        for f in fields.iter().skip(7) {
+            if let Some(a) = parse_at_addr(f.trim_matches('"')) {
+                if !out.contains(&a) {
+                    out.push(a);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// Decode an AT-style address.
 ///
 /// Handles three shapes:
@@ -358,8 +382,26 @@ mod tests {
     }
 
     #[test]
-    fn candidate_dedup_keeps_first_source() {
-        let a: IpAddr = "2408:8142:6001:1::".parse().unwrap();
+    fn collects_pcscf_from_every_cgcontrdp_line() {
+        // 第一行是默认承载（没有 P-CSCF 字段），第二行才是 IMS 上下文。
+        let resp = "\
++CGCONTRDP: 1,5,3gnet,10.230.169.144,36.8.132.86.4.22.253.204.0.0.0.0.0.0.0.1, 128.0.0.0.0.0.0.0.0.0.0.0.0.0.2.0,120.80.80.80,221.5.88.88\r
++CGCONTRDP: 3,6,\"ims.epc.mnc001.mcc460.gprs\",\"36.8.133.86.162.49.16.78.0.0.0.0.0.0.0.1\",\"36.8.133.86.162.49.16.78.217.240.204.160.55.10.58.159\",\"36.8.136.136.0.0.136.136.0.0.0.0.0.0.0.8\",\"\",\"36.8.129.66.96.1.0.1.0.0.0.0.0.0.0.0\"\r
+OK";
+        let list = collect_cgcontrdp_pcscf(resp);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0], "2408:8142:6001:1::".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn no_pcscf_field_yields_empty() {
+        // 联通实测的真实返回：只有 7 个字段，第 8 个 P-CSCF 不存在。
+        let resp = "+CGCONTRDP: 3,7,ims.epc.mnc001.mcc460.gprs,36.8.132.86.4.51.143.3.0.0.0.0.0.0.0.1, 128.0.0.0.0.0.0.0.0.0.0.0.0.0.2.0, 8.136.136.0.0.136.136.0.0.0.0.0.0.0.8.36, 8.136.153.0.0.136.153.0.0.0.0.0.0.0.8.254";
+        assert!(collect_cgcontrdp_pcscf(resp).is_empty());
+    }
+
+    #[test]
+    fn candidate_dedup_keeps_first_source() {        let a: IpAddr = "2408:8142:6001:1::".parse().unwrap();
         let list = collect_candidates(&[a], &[a], &[a], &[a]).unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].source, PcscfSource::Profile);

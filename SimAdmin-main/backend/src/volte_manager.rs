@@ -103,6 +103,7 @@ impl VolteManager {
                 roaming_allowed: cfg.roaming_allowed,
                 data_path_intent: cfg.data_path_intent.clone(),
                 smsc: cfg.smsc.clone(),
+                pcscf: cfg.pcscf.clone(),
                 interface: cfg.interface.clone(),
                 mux: cfg.mux,
                 prefer_ipsec: cfg.prefer_ipsec,
@@ -320,13 +321,29 @@ fn runtime_config(cfg: &VolteConfig) -> RuntimeConfig {
         profile: None,
         mux: cfg.mux,
         interface: Some(cfg.interface.trim().to_string()).filter(|s| !s.is_empty()),
-        pcscf: None,
+        pcscf: parse_pcscf(&cfg.pcscf),
         smsc: cfg.smsc.trim().to_string(),
         refresh_secs: cfg.refresh_secs.max(300),
         port_c: cfg.port_c,
         port_s: cfg.port_s,
         prefer_ipsec: cfg.prefer_ipsec,
         sms_enabled: cfg.sms_enabled,
+    }
+}
+
+/// 手工配置的 P-CSCF。空串 / 非法值都当成「没有」——非法值在
+/// `apply_settings` 里已经被拒了，这里只是兜底，避免旧配置文件把人卡住。
+fn parse_pcscf(raw: &str) -> Option<std::net::IpAddr> {
+    let t = raw.trim();
+    if t.is_empty() {
+        return None;
+    }
+    match t.parse() {
+        Ok(addr) => Some(addr),
+        Err(_) => {
+            tracing::warn!(target: "simadmin::volte", value = %t, "配置的 P-CSCF 无法解析，忽略");
+            None
+        }
     }
 }
 
@@ -359,6 +376,13 @@ fn apply_settings(cfg: &mut VolteConfig, patch: VolteSettingsRequest) -> Result<
             return Err("短信中心号码格式无效".to_string());
         }
         cfg.smsc = digits;
+    }
+    if let Some(pcscf) = patch.pcscf {
+        let t = pcscf.trim();
+        if !t.is_empty() && t.parse::<std::net::IpAddr>().is_err() {
+            return Err(format!("P-CSCF 不是合法的 IP 地址: {pcscf}"));
+        }
+        cfg.pcscf = t.to_string();
     }
     if let Some(interface) = patch.interface {
         cfg.interface = interface.trim().to_string();
@@ -501,6 +525,7 @@ mod tests {
                 roaming_allowed: None,
                 data_path_intent: None,
                 smsc: None,
+                pcscf: None,
                 interface: None,
                 mux: None,
                 prefer_ipsec: None,
@@ -529,6 +554,59 @@ mod tests {
     }
 
     #[test]
+    fn settings_reject_non_ip_pcscf() {
+        let mut c = cfg();
+        let err = apply_settings(
+            &mut c,
+            VolteSettingsRequest {
+                apn: None,
+                apn_protocol: None,
+                roaming_allowed: None,
+                data_path_intent: None,
+                smsc: None,
+                pcscf: Some("pcscf.example.com".into()),
+                interface: None,
+                mux: None,
+                prefer_ipsec: None,
+                refresh_secs: None,
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("P-CSCF"), "实际错误: {err}");
+
+        // 留空是合法的，表示回到自动发现。
+        apply_settings(
+            &mut c,
+            VolteSettingsRequest {
+                apn: None,
+                apn_protocol: None,
+                roaming_allowed: None,
+                data_path_intent: None,
+                smsc: None,
+                pcscf: Some("   ".into()),
+                interface: None,
+                mux: None,
+                prefer_ipsec: None,
+                refresh_secs: None,
+            },
+        )
+        .unwrap();
+        assert!(c.pcscf.is_empty());
+        assert!(runtime_config(&c).pcscf.is_none());
+    }
+
+    #[test]
+    fn manual_pcscf_reaches_the_bearer_config() {
+        let mut c = cfg();
+        c.pcscf = " 2408:8142:6001:1:: ".to_string();
+        let rc = runtime_config(&c);
+        assert_eq!(
+            rc.pcscf,
+            Some("2408:8142:6001:1::".parse::<std::net::IpAddr>().unwrap())
+        );
+    }
+
+    #[test]
     fn settings_normalise_smsc_and_protocol() {
         let mut c = cfg();
         apply_settings(
@@ -539,6 +617,7 @@ mod tests {
                 roaming_allowed: Some(true),
                 data_path_intent: Some("secondary_qmi_data".into()),
                 smsc: Some("+86 138 0067 8910".into()),
+                pcscf: Some(" 10.54.0.1 ".into()),
                 interface: Some(" wwan0.2 ".into()),
                 mux: Some(3),
                 prefer_ipsec: Some(false),
@@ -551,6 +630,7 @@ mod tests {
         assert!(c.roaming_allowed);
         assert_eq!(c.data_path_intent, "secondary_qmi_data");
         assert_eq!(c.smsc, "+8613800678910");
+        assert_eq!(c.pcscf, "10.54.0.1", "P-CSCF 两侧空白要被去掉");
         assert_eq!(c.interface, "wwan0.2");
         assert_eq!(c.mux, 3);
         assert!(!c.prefer_ipsec);

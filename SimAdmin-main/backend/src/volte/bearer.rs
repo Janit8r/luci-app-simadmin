@@ -191,11 +191,17 @@ fn finish(
         .collect();
 
     // 运营商经常不在 QMI/AT 里下发 P-CSCF。联通实测：`--wds-get-current-settings`
-    // 完全没有 0x1F（P-CSCF）TLV，`AT+CGCONTRDP` 只列默认承载的 cid 1，
-    // 于是上面三条来源全是空的。兜底办法是直接在 IMS 承载所在 /24 里探 SIP：
-    // 谁回 `SIP/2.0` 就认为谁是 P-CSCF。
+    // 完全没有 0x1F（P-CSCF）TLV，`AT+CGCONTRDP` 第 8 字段为空，公网 DNS 也不发布
+    // `pcscf.mnc001.mcc460.3gppnetwork.org`。兜底办法是直接在 IMS 承载所在 /24 里
+    // 探 SIP：谁回 `SIP/2.0` 就认为谁是 P-CSCF。
     let filtered = if filtered.is_empty() {
-        match probe_pcscf(local) {
+        let addressing = pcscf::ImsBearerAddressing {
+            interface: interface.clone(),
+            local,
+            prefix,
+            gateway: raw.gateway,
+        };
+        match probe_pcscf(&addressing) {
             Some(addr) => {
                 tracing::info!(
                     target: "simadmin::volte",
@@ -716,35 +722,137 @@ fn run_ip(ip: &str, args: &[String]) -> Result<bool, String> {
 }
 
 /// 通过 ModemManager 的 AT 通道读 `+CGCONTRDP` 里的 P-CSCF（有 MM 时最准）。
+///
+/// 高通模组默认**不在** `+CGCONTRDP` 里带 P-CSCF 字段，必须先打开上报：
+/// `AT$QCPDPIMSCFGE=<cid>,1,1,1`。这一步在参考实现（`ims/pcscf.rs`）里是有的，
+/// 但之前的 SimAdmin 版本只定义了函数、从来没调用过，所以永远读不到。
+///
+/// cid 是 PDP 上下文号，不知道运营商给 IMS 分配了哪个，逐个试 1..=4。
 fn discover_pcscf_via_at(cfg: &BearerConfig) -> Vec<IpAddr> {
     if cfg.pcscf.is_some() {
         return Vec::new();
     }
-    let output = Command::new("mmcli")
+
+    let mut out: Vec<IpAddr> = Vec::new();
+
+    for cid in 1..=4u32 {
+        let _ = Command::new("mmcli")
+            .args([
+                "-m",
+                "any",
+                &format!("--command={}", pcscf::at_enable_pcscf_reporting(cid)),
+            ])
+            .output();
+    }
+
+    if let Ok(output) = Command::new("mmcli")
         .args(["-m", "any", "--command=AT+CGCONTRDP"])
-        .output();
-    match output {
-        Ok(output) if output.status.success() => {
-            let text = String::from_utf8_lossy(&output.stdout).to_string();
-            match pcscf::parse_cgcontrdp(&text) {
-                Ok((_, _, list)) => list,
-                Err(_) => Vec::new(),
+        .output()
+    {
+        if output.status.success() {
+            push_cgcontrdp_pcscf(&mut out, &String::from_utf8_lossy(&output.stdout));
+        }
+    }
+
+    for cid in 1..=4u32 {
+        if let Ok(output) = Command::new("mmcli")
+            .args([
+                "-m",
+                "any",
+                &format!("--command={}", pcscf::at_read_dynamic_params(cid)),
+            ])
+            .output()
+        {
+            if output.status.success() {
+                push_cgcontrdp_pcscf(&mut out, &String::from_utf8_lossy(&output.stdout));
             }
         }
-        _ => Vec::new(),
+    }
+
+    if !out.is_empty() {
+        tracing::info!(
+            target: "simadmin::volte",
+            count = out.len(),
+            "AT+CGCONTRDP 拿到 P-CSCF"
+        );
+    }
+    out
+}
+
+fn push_cgcontrdp_pcscf(out: &mut Vec<IpAddr>, text: &str) {
+    for addr in pcscf::collect_cgcontrdp_pcscf(text) {
+        if !out.contains(&addr) {
+            out.push(addr);
+        }
     }
 }
 
 /// 在 IMS 承载所在 /24 里探测 P-CSCF。
 ///
-/// 做法：从承载自己的地址发出 SIP OPTIONS（源端口临时分配），先把整个 /24
-/// 打一遍再统一收包，谁回 `SIP/2.0` 就把它的源地址当作 P-CSCF。
-/// 254 个包、6 秒窗口，代价可以接受；IPv6 网段太大，不扫。
-fn probe_pcscf(local: IpAddr) -> Option<IpAddr> {
-    let candidates = scan_candidates(local);
+/// 做法：从承载自己的地址发出 SIP REGISTER，先把整个 /24 打一遍再统一收包，
+/// 谁回 `SIP/2.0` 就把它的源地址当作 P-CSCF。
+///
+/// 两个实测踩过的坑：
+/// 1. **必须先装 /24 路由指向 IMS 网关**。`apply_addressing` 装的默认路由是
+///    metric 2000，而默认数据承载的默认路由 metric 10，扫 /24 时落在 /29 之外的
+///    240 多个地址全被内核丢给数据承载，从 IMS 口一个包都没发出去。
+/// 2. **用 REGISTER 而不是 OPTIONS**。很多 P-CSCF 不实现 OPTIONS，但对
+///    REGISTER 一定会回 401 挑战；用 OPTIONS 探会得到「无人应答」的假阴性。
+fn probe_pcscf(bearer: &pcscf::ImsBearerAddressing) -> Option<IpAddr> {
+    let IpAddr::V4(v4) = bearer.local else {
+        // IPv6 /64 没法扫，别浪费时间。
+        return None;
+    };
+    let candidates = scan_candidates(bearer.local);
     if candidates.is_empty() {
         return None;
     }
+
+    let o = v4.octets();
+    let cidr = format!("{}.{}.{}.0/24", o[0], o[1], o[2]);
+    let installed = match bearer.gateway {
+        Some(IpAddr::V4(gw)) => match ip_bin() {
+            Ok(ip) => {
+                let args: Vec<String> = [
+                    "route",
+                    "replace",
+                    &cidr,
+                    "via",
+                    &gw.to_string(),
+                    "dev",
+                    &bearer.interface,
+                ]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+                let _ = run_ip(ip, &args);
+                true
+            }
+            Err(_) => false,
+        },
+        _ => false,
+    };
+    if !installed {
+        tracing::warn!(
+            target: "simadmin::volte",
+            interface = %bearer.interface,
+            cidr = %cidr,
+            "P-CSCF 探测：没有 IPv4 网关，扫描流量可能走错承载"
+        );
+    }
+
+    let result = probe_pcscf_inner(bearer.local, &candidates);
+
+    if installed {
+        if let Ok(ip) = ip_bin() {
+            let args: Vec<String> = ["route", "del", &cidr].iter().map(|s| s.to_string()).collect();
+            let _ = run_ip(ip, &args);
+        }
+    }
+    result
+}
+
+fn probe_pcscf_inner(local: IpAddr, candidates: &[IpAddr]) -> Option<IpAddr> {
     let socket = match std::net::UdpSocket::bind(std::net::SocketAddr::new(local, 0)) {
         Ok(socket) => socket,
         Err(e) => {
@@ -754,9 +862,9 @@ fn probe_pcscf(local: IpAddr) -> Option<IpAddr> {
     };
     let _ = socket.set_read_timeout(Some(Duration::from_millis(300)));
     let local_port = socket.local_addr().map(|a| a.port()).unwrap_or(0);
-    let request = options_request(local, local_port);
+    let request = register_request(local, local_port);
 
-    for addr in &candidates {
+    for addr in candidates {
         let _ = socket.send_to(
             request.as_bytes(),
             std::net::SocketAddr::new(*addr, 5060),
@@ -800,15 +908,25 @@ fn scan_candidates(local: IpAddr) -> Vec<IpAddr> {
     out
 }
 
-fn options_request(local: IpAddr, port: u16) -> String {
+/// 探测用的 REGISTER。
+///
+/// 为什么不用 OPTIONS：实测公网 P-CSCF 对 OPTIONS 完全不响应，但对 REGISTER
+/// 一定回 `401 Unauthorized`（要走 AKA 挑战）。用 OPTIONS 会把可达的 P-CSCF
+/// 误判成「无人应答」。
+fn register_request(local: IpAddr, port: u16) -> String {
+    let domain = "ims.mnc001.mcc460.3gppnetwork.org";
+    let user = "probe";
     format!(
-        "OPTIONS sip:pcscf SIP/2.0\r\n\
+        "REGISTER sip:{domain} SIP/2.0\r\n\
          Via: SIP/2.0/UDP {local}:{port};branch=z9hG4bKprobe{port}\r\n\
          Max-Forwards: 70\r\n\
-         From: <sip:probe@{local}>;tag=probe\r\n\
-         To: <sip:pcscf>\r\n\
+         From: <sip:{user}@{domain}>;tag=probe{port}\r\n\
+         To: <sip:{user}@{domain}>\r\n\
          Call-ID: probe-{port}@{local}\r\n\
-         CSeq: 1 OPTIONS\r\n\
+         CSeq: 1 REGISTER\r\n\
+         Contact: <sip:{user}@{local}:{port};transport=udp>\r\n\
+         Expires: 600000\r\n\
+         User-Agent: simadmin-probe\r\n\
          Content-Length: 0\r\n\r\n"
     )
 }
@@ -892,13 +1010,16 @@ mod tests {
     }
 
     #[test]
-    fn options_request_is_well_formed() {
+    fn register_probe_is_well_formed() {
         let local: IpAddr = "10.140.149.124".parse().unwrap();
-        let text = options_request(local, 47481);
-        assert!(text.starts_with("OPTIONS sip:pcscf SIP/2.0\r\n"));
+        let text = register_request(local, 47481);
+        assert!(text.starts_with("REGISTER sip:ims.mnc001.mcc460.3gppnetwork.org SIP/2.0\r\n"));
         assert!(text.contains("Via: SIP/2.0/UDP 10.140.149.124:47481;branch="));
-        assert!(text.contains("CSeq: 1 OPTIONS"));
+        assert!(text.contains("CSeq: 1 REGISTER"));
+        assert!(text.contains("Contact: <sip:probe@10.140.149.124:47481;transport=udp>"));
         assert!(text.ends_with("Content-Length: 0\r\n\r\n"));
+        // OPTIONS 会被 P-CSCF 忽略，别退回去。
+        assert!(!text.contains("OPTIONS"));
     }
 
     #[test]

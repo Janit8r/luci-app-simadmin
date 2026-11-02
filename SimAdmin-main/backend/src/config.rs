@@ -1752,6 +1752,13 @@ pub struct VolteConfig {
     /// 短信中心号码覆盖；空 = `AT+CSCA?` → EF_SMSC 自动探测。
     #[serde(default)]
     pub smsc: String,
+    /// P-CSCF 覆盖（IPv4 / IPv6 字面量）；空 = 自动发现。
+    ///
+    /// 中国联通实测：`--wds-get-current-settings` 没有 0x1F（P-CSCF）TLV、
+    /// `AT+CGCONTRDP` 第 8 字段为空、公网 DNS 不发布 `pcscf.mncXXX.mccXXX.3gppnetwork.org`、
+    /// UE 所在 /16 扫完无人应答。所以必须留一个手工入口，否则 IMS 注册无从谈起。
+    #[serde(default)]
+    pub pcscf: String,
     /// 绑定 IMS 承载的网卡名；空 = 自动探测。
     #[serde(default)]
     pub interface: String,
@@ -1818,6 +1825,7 @@ impl Default for VolteConfig {
             roaming_allowed: false,
             data_path_intent: default_volte_data_path(),
             smsc: String::new(),
+            pcscf: String::new(),
             interface: String::new(),
             mux: default_volte_mux(),
             port_c: default_volte_port_c(),

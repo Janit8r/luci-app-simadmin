@@ -59,6 +59,7 @@ cargo build --release --target aarch64-unknown-linux-musl -p simadmin
   "apn": "",
   "apn_protocol": "IPV4V6",
   "smsc": "",
+  "pcscf": "",
   "interface": "",
   "mux": 2,
   "port_c": 47481,
@@ -73,3 +74,36 @@ cargo build --release --target aarch64-unknown-linux-musl -p simadmin
 
 `mux` 与 `apn` 是最可能需要按现场调整的两个参数（默认 `mux=2` 对应 `wwan0.2`，
 APN 为空时按 IMSI 推导 `ims.epc.mncXXX.mccXXX.gprs`）。
+
+### P-CSCF 一定要手填的情况
+
+P-CSCF 按下面顺序找，前一步拿到就不再往下走：
+
+1. `volte.pcscf` 手工配置（最可靠）；
+2. QMI `--wds-get-current-settings` 的 0x1F TLV；
+3. `AT+CGCONTRDP`（会先发 `AT$QCPDPIMSCFGE=<cid>,1,1,1` 打开上报）；
+4. IMS 承载所在 /24 的 SIP 探测（发 REGISTER，收到 `SIP/2.0` 即认定）。
+
+中国联通实测四条全空：QMI 无 0x1F、`+CGCONTRDP` 只有 7 个字段（第 8 个 P-CSCF 不存在）、
+公网 DNS 对 `pcscf.mnc001.mcc460.3gppnetwork.org` 返回 NXDOMAIN、把 UE 所在
+`/16` 全扫一遍无人应答。这种情况下 `runtime.phase` 会停在 `failed`，
+错误码 `volte_runtime_all_pcscf_failed`，**必须**在 `volte.pcscf` 里填上运营商给的地址：
+
+```sh
+# 直接改配置文件后重启服务
+jsonfilter -i /opt/simadmin/data/config.json -e '@.volte' >/dev/null 2>&1
+uci set simadmin.volte.pcscf='10.x.x.x'   # 或用 API：
+curl -s -X POST 127.0.0.1:3000/api/volte/settings \
+     -H 'Content-Type: application/json' \
+     -d '{"pcscf":"10.x.x.x"}'
+```
+
+填好之后重启 `simadmin`，`logread | grep simadmin::volte` 应出现
+`IMS REGISTER 200 OK — 短信通道已接管`。
+
+### 默认数据连接
+
+`/usr/bin/simadmin-data` 用 ModemManager 建默认承载（`mmcli --simple-connect`），
+不要改成手拼 `qmicli --wds-start-network`：bam-dmux 上必须先 bind mux 数据口，
+不带 bind 的会话能拿到地址但数据面是死的。另外 `volte.feature_enabled=false` 时
+它不会等 IMS 注册，否则开机后要空等 `WAIT_IMS`（默认 600s）才有网。
