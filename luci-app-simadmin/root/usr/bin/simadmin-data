@@ -16,7 +16,6 @@
 APNFILE=/var/run/simadmin-data.apn
 DNSDIR=/tmp/resolv.conf.d
 INTERVAL=${INTERVAL:-15}
-WAIT_IMS=${WAIT_IMS:-600}
 
 log() { logger -t simadmin-data "$*"; }
 
@@ -41,46 +40,6 @@ apn_for_op() {
 	esac
 }
 
-boot_secs() {
-	[ -f /var/run/simadmin-data.boot ] || date +%s > /var/run/simadmin-data.boot 2>/dev/null
-	n=$(date +%s 2>/dev/null)
-	b=$(cat /var/run/simadmin-data.boot 2>/dev/null)
-	[ -n "$n" ] || return 1
-	[ -n "$b" ] || return 1
-	echo $((n - b))
-}
-
-ims_ok() {
-	logread 2>/dev/null | grep -q "IMS REGISTER 200 OK"
-}
-
-# volte 功能是否开启。未开启时绝不能等 IMS —— 否则默认数据连接会被
-# 拖到 WAIT_IMS（默认 600s）之后才拉起来，开机后十分钟没网。
-volte_enabled() {
-	grep -q '"feature_enabled"[[:space:]]*:[[:space:]]*true' \
-		/opt/simadmin/config.json 2>/dev/null
-}
-
-ims_wait_done() {
-	s=$(boot_secs)
-	[ -n "$s" ] || return 1
-	[ "$s" -ge "$WAIT_IMS" ]
-}
-
-# IMS 运行时是否已经有结论（注册成功 / 失败 / 未启用）。
-#
-# 有结论就不必再等：IMS 失败后它自己会退避重试，而这里干等只会把默认数据
-# 连接一起拖住。实测联通拿不到 P-CSCF，运行时会在 20 秒内落到 failed，
-# 没有这个判断就要白等满 WAIT_IMS（默认 600s）才有网。
-ims_settled() {
-	p=$(curl -s --max-time 3 http://127.0.0.1:3000/api/volte/control 2>/dev/null |
-		jsonfilter -e '@.data.runtime.phase' 2>/dev/null)
-	case "$p" in
-	registered | failed | disabled) return 0 ;;
-	*) return 1 ;;
-	esac
-}
-
 bearer_ids() {
 	mmcli -m any 2>/dev/null |
 		sed -n 's#.*Bearers *| */org/freedesktop/ModemManager1/Bearer/\([0-9][0-9]*\).*#\1#p'
@@ -96,6 +55,38 @@ bearer_iface() {
 
 bearer_connected() {
 	mmcli -m any -b any 2>/dev/null | grep -q 'connected: *yes'
+}
+
+bearer_addr() {
+	mmcli -m any -b any 2>/dev/null | sed -n 's/^.*| *address: *//p' | head -n 1
+}
+
+bearer_prefix() {
+	mmcli -m any -b any 2>/dev/null | sed -n 's/^.*| *prefix: *//p' | head -n 1
+}
+
+bearer_gateway() {
+	mmcli -m any -b any 2>/dev/null | sed -n 's/^.*| *gateway: *//p' | head -n 1
+}
+
+# 把承载的地址/路由补到网卡上。
+#
+# 正常情况下 ModemManager 会自己配好，但模组被固件看门狗复位之后，
+# MM 会出现「bearer 报 connected、地址也对，但网卡上什么都没有」的状态
+# （实测 wwan0 停在 DOWN 且无地址，手动 ip addr add 后立刻通）。
+# 这里做一次幂等兜底：replace 语义，MM 已经配过也不会出错。
+apply_bearer_ip() {
+	n=$(bearer_iface)
+	a=$(bearer_addr)
+	p=$(bearer_prefix)
+	g=$(bearer_gateway)
+	[ -n "$n" ] && [ -n "$a" ] && [ -n "$p" ] || return 1
+	ip link set "$n" up 2>/dev/null
+	ip addr replace "$a/$p" dev "$n" 2>/dev/null
+	if [ -n "$g" ]; then
+		ip route replace default via "$g" dev "$n" metric 10 2>/dev/null
+	fi
+	return 0
 }
 
 data_ok() {
@@ -123,27 +114,41 @@ drop_bearer() {
 connect() {
 	apn=$1
 	mmcli -m any --simple-connect="apn=$apn,ip-type=ipv4" >/dev/null 2>&1 || return 1
+	apply_bearer_ip
 	i=0
 	while [ "$i" -lt 6 ]; do
 		if data_ok; then
 			return 0
 		fi
+		apply_bearer_ip
 		i=$((i + 1))
 		sleep 2
 	done
 	return 1
 }
 
+# 模组是否已经被 ModemManager 认出来。
+#
+# mpss 固件初始化期间如果被用户态反复打开 QMI 口，固件自己的看门狗会报
+# `dog.c:1498:Watchdog detects stalled initialization` 然后崩溃重启（实测：
+# 开着守护进程开机必崩一次，禁掉守护进程开机零崩溃）。所以这里先确认
+# 模组在，再去做任何 QMI/AT 操作。
+modem_present() {
+	mmcli -L 2>/dev/null | grep -q '/Modem/'
+}
+
 run_once() {
-	if volte_enabled && ! ims_ok; then
-		if ims_settled; then
-			log "ims settled, bring up data"
-		elif ! ims_wait_done; then
-			log "wait ims"
-			return 1
-		else
-			log "ims timeout"
-		fi
+	# 这里**不**等 IMS 注册。
+	#
+	# 早期版本会先等 IMS 注册（最多 WAIT_IMS=600s）再拉默认承载，怕两条
+	# 数据连接抢同一个口。现在不会了：IMS PDN 由 simadmin 自己的 QMI 代码
+	# 拉在 mux2（wwan2），默认承载走 mux0（wwan0），两者完全独立，
+	# 同时在线已实测可用。留着门控只会在 IMS 注册不上时（联通拿不到
+	# P-CSCF 就是这种）让设备开机后十分钟没网。
+
+	if ! modem_present; then
+		log "no modem yet"
+		return 1
 	fi
 
 	if data_ok; then
@@ -156,6 +161,13 @@ run_once() {
 	[ -n "$apn" ] || apn=$(apn_for_op "$op")
 	[ -n "$apn" ] || apn=$(sed -n '1s/ .*//p' "$APNFILE" 2>/dev/null)
 	[ -n "$apn" ] || apn=3gnet
+
+	# 承载在但网卡上没地址：先自己补一次，别急着拆掉重拨。
+	if bearer_connected && apply_bearer_ip && data_ok; then
+		refresh_dns
+		log "reapplied bearer ip iface=$(bearer_iface)"
+		return 0
+	fi
 
 	# 已经有承载但数据面不通：拆掉重来。
 	if bearer_connected; then
