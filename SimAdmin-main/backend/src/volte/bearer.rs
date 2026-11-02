@@ -226,10 +226,13 @@ fn finish(
 // ---------------------------------------------------------------------------
 
 fn qmicli_bring_up(cfg: &BearerConfig) -> Result<BearerRaw, String> {
-    // IMS APN 给 IPv6 才谈得上 3GPP IPsec（TS 33.203 假定 IPv6 承载），
-    // 但个别省份/省份漫游时只给 IPv4，所以先 6 后 4 各试一次。
+    // 先 IPv4 再 IPv6。
+    //
+    // 原因：运营商经常不在 QMI/AT 里下发 P-CSCF（联通实测就是），兜底只能靠
+    // 网段探测，而 IPv6 /64 根本没法扫。IPv4 承载下 /24 扫一遍就能找到 P-CSCF，
+    // 所以默认走 IPv4；IPv6 留给 IPsec（真拿到 P-CSCF 后再按需切）。
     let mut errors = Vec::new();
-    for ip_type in ["6", "4"] {
+    for ip_type in ["4", "6"] {
         match qmicli_bring_up_family(cfg, ip_type) {
             Ok(raw) => return Ok(raw),
             Err(e) => errors.push(format!("ip-type={ip_type}: {e}")),
