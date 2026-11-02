@@ -1,0 +1,70 @@
+#!/bin/sh /etc/rc.common
+#
+# 让 mpss 固件在「系统已经静下来」之后再引导，避开它自己的初始化看门狗。
+#
+# ---------------------------------------------------------------------------
+# 结论先说：**mpss 什么时候上电，决定了它会不会崩。**
+#
+# 实测 dmesg 时间线（同一台机器、同一固件）：
+#
+#   A) 由 ModemManager 在开机约 200s 后触发：
+#        217.6s  powering up 4080000.remoteproc
+#        225.8s  remote processor is now up
+#        fatal error 计数 = 0，数据正常
+#
+#   B) 开机 17s 主动触发（echo start > .../remoteproc0/state）：
+#         17.2s  powering up
+#         24.9s  is now up
+#         64.9s  fatal error: dog.c:1498:Watchdog detects stalled initialization
+#        → 连崩 6 次，最后 /dev/wwan* 不再重建，MM 报 No modems were found
+#
+# 关键点：B 里**没有任何用户态 QMI/AT 流量**（ModemManager 被本脚本挡着），
+# 照样崩。所以之前「用户态探测踩崩固件」的判断是错的——真正的原因是
+# mpss 自己的初始化在开机早期被拖住（dog.c 是固件内部的初始化看门狗），
+# 而初始化停滞与开机阶段强相关。
+#
+# 反过来说：**ModemManager 的探测就是 mpss 上电的触发器**。所以这个脚本
+# 不能「等节点出现再放行」（节点要靠 MM 才出现，会死锁），也不能自己去
+# 提前拉起 remoteproc（会落在早期窗口里，必崩）。唯一正确的做法是：
+# 单纯把 MM 挡一段时间，等系统静下来再放它进去触发上电。
+# ---------------------------------------------------------------------------
+#
+# 它自己**不做任何 QMI/AT 操作**——不探测、不拉起 remoteproc，只是等。
+
+START=69
+
+# 挡多久再放 ModemManager 进去。
+#
+# 实测对照（同一台机器，每次都是完整重启）：
+#     MIN_WAIT=200  →  fatal error 0 次，数据正常
+#     MIN_WAIT=120  →  fatal error 2 次（能自愈，数据最终也通）
+#     开机 17s 主动拉起 remoteproc → 崩 6 次，最后 /dev/wwan* 不再重建，
+#                                     MM 报 No modems were found，只能重启
+#
+# 所以默认取 200：崩溃会触发「节点不重建」那个不可恢复的故障，宁可开机慢。
+# 想快可以调小，但要清楚这是在拿稳定性换开机时间：
+#     uci set simadmin.settings.modem_wait=120
+#     uci commit simadmin
+MIN_WAIT=${MIN_WAIT:-200}
+
+log() { logger -t simadmin-modem-ready "$*"; }
+
+# 允许用 uci 覆盖等待时间，省得为了调参数去改 /etc/init.d 下的文件。
+apply_uci_wait() {
+	w=$(uci -q get simadmin.settings.modem_wait 2>/dev/null)
+	case "$w" in
+	'' | *[!0-9]*) ;;
+	*) MIN_WAIT=$w ;;
+	esac
+}
+
+boot() {
+	apply_uci_wait
+	log "等待 ${MIN_WAIT}s，让系统静下来后再放行 ModemManager（它会触发 mpss 上电）"
+	sleep "$MIN_WAIT"
+	log "放行 ModemManager"
+	return 0
+}
+
+# 手动触发一次，便于排查时复现开机那条等待路径。
+start() { boot; }

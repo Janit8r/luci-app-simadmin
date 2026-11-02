@@ -35,6 +35,7 @@ define Package/luci-app-simadmin/install
 	$(INSTALL_BIN) ./root/etc/init.d/simadmin-watchdog $(1)/etc/init.d/simadmin-watchdog
 	$(INSTALL_BIN) ./root/etc/init.d/simadmin-imsd $(1)/etc/init.d/simadmin-imsd
 	$(INSTALL_BIN) ./root/etc/init.d/simadmin-data $(1)/etc/init.d/simadmin-data
+	$(INSTALL_BIN) ./root/etc/init.d/simadmin-modem-ready $(1)/etc/init.d/simadmin-modem-ready
 	$(INSTALL_DIR) $(1)/etc/uci-defaults
 	$(INSTALL_BIN) ./root/etc/uci-defaults/99-simadmin $(1)/etc/uci-defaults/99-simadmin
 	$(INSTALL_DIR) $(1)/usr/bin

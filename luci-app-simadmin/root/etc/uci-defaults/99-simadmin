@@ -24,4 +24,9 @@ rm -f /etc/rc.d/S98qmi_auto_activate
 /etc/init.d/simadmin-watchdog enable
 /etc/init.d/simadmin-imsd enable
 
+# 插在 ModemManager（START=70）前面，等 mpss 初始化完再放行。
+# 不加这一步，MM 会在固件初始化窗口里探 AT/QMI 口，触发固件看门狗崩溃，
+# 而崩溃后 /dev/wwan* 不会重建，整机就再也认不到模组了。
+/etc/init.d/simadmin-modem-ready enable
+
 exit 0
