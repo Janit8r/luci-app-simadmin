@@ -241,8 +241,38 @@ fn qmicli_bring_up(cfg: &BearerConfig) -> Result<BearerRaw, String> {
     Err(errors.join("; "))
 }
 
+/// 上一次拉起的 PDN（device, packet handle, cid）。
+///
+/// 同一个 mux 上第二次 `start-network` 会被 QMI 以 PolicyMismatch(79) 拒绝，
+/// 所以每次重试前必须先把上一次的 PDN 拆掉。设备实测：11:54 那一轮就是
+/// ip-type=4 留下的会话把 ip-type=6 顶成了 79。
+static PREV_SESSION: std::sync::Mutex<Option<(String, String, u8)>> = std::sync::Mutex::new(None);
+
+fn stop_previous_session() {
+    let prev = match PREV_SESSION.lock() {
+        Ok(mut guard) => guard.take(),
+        Err(_) => None,
+    };
+    if let Some((device, handle, cid)) = prev {
+        let stop = format!("--wds-stop-network={handle}");
+        let _ = run_qmicli(
+            &device,
+            &[&format!("--client-cid={cid}"), "--client-no-release-cid", &stop],
+        );
+    }
+}
+
+fn remember_session(device: &str, handle: Option<String>, cid: u8) {
+    if let (Some(handle), Ok(mut guard)) = (handle, PREV_SESSION.lock()) {
+        *guard = Some((device.to_string(), handle, cid));
+    }
+}
+
 fn qmicli_bring_up_family(cfg: &BearerConfig, ip_type: &str) -> Result<BearerRaw, String> {
     let device = find_qmi_device().ok_or_else(|| err::QMI_DEVICE_MISSING.to_string())?;
+
+    // 0) 拆掉上一次留下的 PDN，否则这个 mux 上的 start-network 会被拒。
+    stop_previous_session();
 
     // 1) 拿一个不释放的 WDS 客户端 id。
     let out = run_qmicli(&device, &["--wds-noop", "--client-no-release-cid"])?;
@@ -303,6 +333,8 @@ fn qmicli_bring_up_family(cfg: &BearerConfig, ip_type: &str) -> Result<BearerRaw
     if !out.to_ascii_lowercase().contains("network started") {
         return Err(format!("qmicli start-network 未确认: {}", first_line(&out)));
     }
+    let handle = parse_qmicli_handle(&out);
+    remember_session(&device, handle.clone(), cid);
 
     // 4) 读动态参数。
     let settings = run_qmicli(
@@ -313,10 +345,36 @@ fn qmicli_bring_up_family(cfg: &BearerConfig, ip_type: &str) -> Result<BearerRaw
     let mut raw = parse_qmicli_settings(&settings);
     raw.pcscf_hint = parse_pcscf_lines(&settings);
     if raw.local.is_none() {
-        // 拿到了 "network started" 但没地址（家族不匹配），交给上一层换家族重试。
+        // 拿到了 "network started" 但没地址（家族不匹配）。这时候 PDN 其实已经
+        // 建起来了，不拆掉的话下一次 start-network 会被 QMI 以
+        // PolicyMismatch(79) 拒绝（设备实测踩过：ip-type=4 失败后 ip-type=6 直接 79）。
+        if let Some(handle) = handle {
+            let stop = format!("--wds-stop-network={handle}");
+            let _ = run_qmicli(
+                &device,
+                &[&format!("--client-cid={cid}"), "--client-no-release-cid", &stop],
+            );
+        }
+        if let Ok(mut guard) = PREV_SESSION.lock() {
+            *guard = None;
+        }
         return Err("qmicli 未拿到本机地址".to_string());
     }
     Ok(raw)
+}
+
+/// `[/dev/wwan0qmi0] Network started:\n\tPacket data handle: '2334478736'`
+fn parse_qmicli_handle(output: &str) -> Option<String> {
+    for line in output.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("Packet data handle:") {
+            let value = rest.trim().trim_matches('\'').trim_matches('"');
+            if !value.is_empty() && value.chars().all(|c| c.is_ascii_digit()) {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
 }
 
 fn run_qmicli(device: &str, args: &[&str]) -> Result<String, String> {
@@ -841,5 +899,13 @@ mod tests {
         assert!(text.contains("Via: SIP/2.0/UDP 10.140.149.124:47481;branch="));
         assert!(text.contains("CSeq: 1 OPTIONS"));
         assert!(text.ends_with("Content-Length: 0\r\n\r\n"));
+    }
+
+    #[test]
+    fn parses_packet_data_handle() {
+        let out = "[/dev/wwan0qmi0] Network started\n\tPacket data handle: '2334478736'\n";
+        assert_eq!(parse_qmicli_handle(out).as_deref(), Some("2334478736"));
+        assert_eq!(parse_qmicli_handle("no handle here"), None);
+        assert_eq!(parse_qmicli_handle("Packet data handle: 'abc'"), None);
     }
 }
