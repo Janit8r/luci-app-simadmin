@@ -820,7 +820,8 @@ mod tests {
     fn scan_covers_whole_slash24_without_self() {
         let local: IpAddr = "10.140.149.124".parse().unwrap();
         let list = scan_candidates(local);
-        assert_eq!(list.len(), 254);
+        // /24 里 254 个可用主机地址，去掉自己
+        assert_eq!(list.len(), 253);
         assert!(!list.contains(&local), "不能把探测包发给自己");
         assert!(list.contains(&"10.140.149.125".parse::<IpAddr>().unwrap()));
         assert!(list.contains(&"10.140.149.1".parse::<IpAddr>().unwrap()));
