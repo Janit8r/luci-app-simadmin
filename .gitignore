@@ -1,0 +1,31 @@
+# Rust 构建产物
+target/
+SimAdmin-main/target/
+SimAdmin-main/backend/target/
+.cargo-target*/
+*.rs.bk
+
+# 参考实现（已整包并入 SimAdmin-main/backend/src/volte，避免两份分叉）
+/ims/
+
+# README 用的截图（16MB PNG，与构建无关）
+SimAdmin-main/static/
+
+# 前端依赖
+SimAdmin-main/frontend/node_modules/
+SimAdmin-main/frontend/dist/
+SimAdmin-main/frontend/.vite/
+
+# 构建/发布产物
+release/
+*.bin
+*.ipk
+temp/
+.tmp/
+
+# 编辑器与系统
+.DS_Store
+Thumbs.db
+*.swp
+.vscode/
+.idea/
