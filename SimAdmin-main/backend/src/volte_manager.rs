@@ -408,6 +408,11 @@ fn settings_changed(before: &VolteConfig, after: &VolteConfig) -> bool {
         || before.roaming_allowed != after.roaming_allowed
         || before.data_path_intent != after.data_path_intent
         || before.smsc != after.smsc
+        // 漏掉这一项时，单独改 P-CSCF 会被判成「没变化」直接 return Ok，
+        // 于是既不落盘也不重启会话——接口返回成功，配置却没变。
+        // 实测就是靠这条踩出来的：POST {"pcscf":"2408:..."} 之后
+        // GET /api/volte/control 里还是空串。
+        || before.pcscf != after.pcscf
         || before.interface != after.interface
         || before.mux != after.mux
         || before.prefer_ipsec != after.prefer_ipsec
@@ -512,6 +517,24 @@ mod tests {
         assert!(rc.interface.is_none());
         assert_eq!(rc.smsc, "+8613800678910");
         assert_eq!(rc.refresh_secs, 300, "刷新周期下限 300s");
+    }
+
+    #[test]
+    fn settings_changed_detects_pcscf() {
+        // 单独改 P-CSCF 必须被认成「变了」。
+        //
+        // 漏掉这一项时 update_settings 会在 settings_changed 那里提前
+        // return Ok，既不落盘也不重建会话，而 HTTP 仍然返回成功 ——
+        // 表现为「设置保存了但没生效」，实测踩过。
+        let before = cfg();
+        let mut after = cfg();
+        after.pcscf = "2408:8142:6001:1007::1".to_string();
+        assert!(settings_changed(&before, &after));
+    }
+
+    #[test]
+    fn settings_changed_is_false_for_identical_config() {
+        assert!(!settings_changed(&cfg(), &cfg()));
     }
 
     #[test]

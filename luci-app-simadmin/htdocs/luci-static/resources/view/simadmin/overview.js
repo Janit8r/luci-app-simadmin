@@ -114,6 +114,12 @@ function renderStatus(data) {
 		parts.push(chip('通道', rt.registration_mode === 'register_ipsec' ? 'IPsec' : 'UDP'));
 	if (rt.interface)
 		parts.push(chip('网卡', rt.interface));
+	if (cfg.pcscf)
+		parts.push(chip('P-CSCF', cfg.pcscf));
+	else if (rt.pcscf)
+		parts.push(chip('P-CSCF', rt.pcscf + '（自动）'));
+	else
+		parts.push(chip('P-CSCF', '未配置', PHASE_STYLE.starting));
 	if (rt.ue_address)
 		parts.push(chip('UE', rt.ue_address));
 	if (rt.smsc)
@@ -146,6 +152,9 @@ function renderStatus(data) {
 		button(smsLabel, '', busy || !cfg.feature_enabled, function() {
 			act('sms', { enabled: !cfg.sms_enabled });
 		}),
+		button('P-CSCF', '', busy, function() {
+			editPcscf(cfg);
+		}),
 		button('重新注册', '', busy || !cfg.feature_enabled, function() {
 			act('refresh', {});
 		})
@@ -168,6 +177,44 @@ function act(path, body) {
 	}).finally(function() {
 		busy = false;
 	});
+}
+
+/*
+ * 手工填写 P-CSCF。
+ *
+ * 本网实测自动发现全军覆没，所以这个入口是必须的：
+ *   - QMI `--wds-get-current-settings` 没有 0x1F（P-CSCF）TLV
+ *   - `AT+CGCONTRDP` 只对 AT 激活的上下文吐 P-CSCF，而 QMI 拉起的会话
+ *     根本不出现在这个命令里
+ *   - 公网 DNS 不发布 pcscf.*.3gppnetwork.org，而且那台 DNS 对任意不存在
+ *     的域名也回 NOERROR/0（实测），所以 DNS 发现的结果不可信
+ *
+ * 留空 = 回到自动发现。
+ */
+function editPcscf(cfg) {
+	var input = E('input', {
+		'class': 'cbi-input-text',
+		'style': 'width:100%;box-sizing:border-box',
+		'placeholder': '例如 2408:8142:6001:1007::1（留空 = 自动发现）',
+		'value': cfg.pcscf || ''
+	});
+
+	return ui.showModal('P-CSCF', [
+		E('p', { 'style': 'margin:0 0 10px;line-height:1.6' }, [
+			'IMS 注册必须先知道 P-CSCF。本网实测无法自动发现，' +
+			'需要时在这里手工指定（IPv4 / IPv6 字面量，不要带引号）。'
+		]),
+		input
+	], [
+		button('保存', 'cbi-button-action important', false, function() {
+			var v = (input.value || '').trim();
+			ui.hideModal();
+			act('settings', { pcscf: v });
+		}),
+		button('取消', '', false, function() {
+			ui.hideModal();
+		})
+	]);
 }
 
 function pollStatus() {
