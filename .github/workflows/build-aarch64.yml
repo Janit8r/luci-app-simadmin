@@ -3,6 +3,9 @@ name: build-aarch64
 # 目标：产出可直接放进 luci-app-simadmin/root/opt/simadmin/ 的 aarch64-musl 二进制。
 # 本机（Windows）没有 aarch64-linux-musl 交叉编译器，ring / rusqlite 的 C 部分编不过，
 # 所以交叉编译放在 Linux runner 上做。
+#
+# 工具链走 cross（ghcr.io 上的官方 musl 镜像）而不是 musl.cc 预编译包：
+# musl.cc 经常连不上，且镜像里是真正的 aarch64-linux-musl-gcc，ring 的汇编能正常编。
 
 on:
   push:
@@ -22,10 +25,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   TARGET: aarch64-unknown-linux-musl
-  # musl 目标必须用 musl 专用 gcc；gcc-aarch64-linux-gnu（glibc）会链接失败。
-  CC_aarch64_unknown_linux_musl: aarch64-linux-musl-gcc
-  AR_aarch64_unknown_linux_musl: aarch64-linux-musl-ar
-  CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-musl-gcc
+  CROSS_VERSION: v0.2.5
 
 jobs:
   # 先跑纯逻辑单测（SIP 报文、RPDU/TPDU 编解码、EF_SMSC 解析、去重落库…），
@@ -57,22 +57,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install aarch64 musl cross toolchain
+      - name: Install cross
         run: |
           set -euo pipefail
-          for url in \
-            "https://musl.cc/aarch64-linux-musl-cross.tgz" \
-            "https://more.musl.cc/11.2.1/x86_64-linux-musl/aarch64-linux-musl-cross.tgz" \
-            "https://more.musl.cc/10.2.1/x86_64-linux-musl/aarch64-linux-musl-cross.tgz"; do
-            echo "== downloading $url"
-            if curl -fsSL --retry 3 --retry-delay 5 --max-time 600 -o /tmp/musl.tgz "$url"; then
-              ok=1; break
-            fi
-          done
-          [ "${ok:-0}" = "1" ] || { echo "所有 musl 工具链镜像都下载失败"; exit 1; }
-          sudo tar -xzf /tmp/musl.tgz -C /opt
-          echo "/opt/aarch64-linux-musl-cross/bin" >> "$GITHUB_PATH"
-          /opt/aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc --version | head -1
+          url="https://github.com/cross-rs/cross/releases/download/${CROSS_VERSION}/cross-x86_64-unknown-linux-gnu.tar.gz"
+          curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors --max-time 300 -o /tmp/cross.tgz "$url"
+          mkdir -p /tmp/cross-bin
+          tar -xzf /tmp/cross.tgz -C /tmp/cross-bin
+          # release 包里可能是裸二进制也可能带目录前缀，统一 find 出来再装
+          bin="$(find /tmp/cross-bin -type f -name cross -perm -u+x | head -n1)"
+          test -n "$bin"
+          sudo install -m 0755 "$bin" /usr/local/bin/cross
+          cross --version
+
+      # 先把镜像拉下来：镜像拉取失败会在这里直接报错，
+      # 而不是等到 cargo 编译到一半才暴露成难读的容器错误。
+      - name: Pull cross image
+        run: docker pull "ghcr.io/cross-rs/${TARGET}:${CROSS_VERSION#v}"
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -86,13 +87,13 @@ jobs:
 
       - name: Build simadmin
         working-directory: SimAdmin-main
-        run: |
-          rustup target add "$TARGET"
-          cargo build --release --locked --target "$TARGET" -p simadmin
+        run: cross build --release --locked --target "$TARGET" -p simadmin
 
       - name: Stage binary into LuCI package
         run: |
           set -euo pipefail
+          # cross 以 root 在容器里写 target/，先交还属主再拷贝
+          sudo chown -R "$(id -u):$(id -g)" "SimAdmin-main/target"
           mkdir -p out
           cp "SimAdmin-main/target/$TARGET/release/simadmin" out/simadmin
           file out/simadmin
