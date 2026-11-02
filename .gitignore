@@ -25,6 +25,6 @@ temp/
 .tmp
 test/
 tests/
-build/
+/build/
 TODO.md
 TODO-VOLTE.md
