@@ -114,7 +114,12 @@ load_bearer() {
 
 bearer_connected() {
 	load_bearer || return 1
-	[ "$B_CONNECTED" = 1 ]
+	# 必须同时「connected」且「有 interface」。
+	#
+	# 只看 connected 会被 `type: default-attach` 骗到：那个抽象对象永远
+	# connected: yes 却没有 interface。一旦信了它，run_once 就会以为承载
+	# 还在、只是网卡没地址，于是反复 apply_bearer_ip 失败，而不是去重拨。
+	[ "$B_CONNECTED" = 1 ] && [ -n "$B_IFACE" ]
 }
 
 # 把承载的地址/路由补到网卡上。
