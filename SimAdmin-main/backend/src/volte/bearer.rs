@@ -190,6 +190,26 @@ fn finish(
         .filter(|addr| matches!((addr, family), (IpAddr::V4(_), super::ImsFamily::V4) | (IpAddr::V6(_), super::ImsFamily::V6)))
         .collect();
 
+    // 运营商经常不在 QMI/AT 里下发 P-CSCF。联通实测：`--wds-get-current-settings`
+    // 完全没有 0x1F（P-CSCF）TLV，`AT+CGCONTRDP` 只列默认承载的 cid 1，
+    // 于是上面三条来源全是空的。兜底办法是直接在 IMS 承载所在 /24 里探 SIP：
+    // 谁回 `SIP/2.0` 就认为谁是 P-CSCF。
+    let filtered = if filtered.is_empty() {
+        match probe_pcscf(local) {
+            Some(addr) => {
+                tracing::info!(
+                    target: "simadmin::volte",
+                    pcscf = %addr,
+                    "QMI/AT 未下发 P-CSCF，改由网段探测得到"
+                );
+                vec![addr]
+            }
+            None => filtered,
+        }
+    } else {
+        filtered
+    };
+
     Some(ImsBearer {
         interface,
         local,
@@ -206,15 +226,70 @@ fn finish(
 // ---------------------------------------------------------------------------
 
 fn qmicli_bring_up(cfg: &BearerConfig) -> Result<BearerRaw, String> {
+    // IMS APN 给 IPv6 才谈得上 3GPP IPsec（TS 33.203 假定 IPv6 承载），
+    // 但个别省份/省份漫游时只给 IPv4，所以先 6 后 4 各试一次。
+    let mut errors = Vec::new();
+    for ip_type in ["6", "4"] {
+        match qmicli_bring_up_family(cfg, ip_type) {
+            Ok(raw) => return Ok(raw),
+            Err(e) => errors.push(format!("ip-type={ip_type}: {e}")),
+        }
+    }
+    Err(errors.join("; "))
+}
+
+fn qmicli_bring_up_family(cfg: &BearerConfig, ip_type: &str) -> Result<BearerRaw, String> {
     let device = find_qmi_device().ok_or_else(|| err::QMI_DEVICE_MISSING.to_string())?;
 
     // 1) 拿一个不释放的 WDS 客户端 id。
     let out = run_qmicli(&device, &["--wds-noop", "--client-no-release-cid"])?;
     let cid = parse_qmicli_cid(&out).ok_or_else(|| "qmicli 未返回 CID".to_string())?;
 
-    // 2) 拉起 PDN。
+    // 2) 绑定 mux。
+    //
+    // bam-dmux / qmap 设备上默认数据口已经占用了「未绑定」的通道，此时直接
+    // start-network 会被 QMI 以 PolicyMismatch(79) 拒绝（旧实现走 mmcli
+    // simple-connect 就是死在这里）。先绑 mux，让 IMS PDN 落到独立数据口。
+    //
+    // 参数形态随 libqmi 版本不同：
+    //   qmicli >= 1.30 只认 `--wds-bind-mux-data-port="mux-id=N,ep-type=...,ep-iface-number=N"`
+    //   （实测 1.38 里根本没有 `--wds-bind-mux-id`）
+    // 内嵌 modem（bam-dmux）必须带 endpoint 信息，否则驱动不认。
+    let bind_variants = [
+        format!(
+            "--wds-bind-mux-data-port=mux-id={mux},ep-type=bam-dmux,ep-iface-number={mux}",
+            mux = cfg.mux
+        ),
+        format!(
+            "--wds-bind-mux-data-port=mux-id={mux},ep-type=embedded,ep-iface-number={mux}",
+            mux = cfg.mux
+        ),
+        format!("--wds-bind-mux-data-port=mux-id={}", cfg.mux),
+        format!("--wds-bind-mux-id={}", cfg.mux),
+    ];
+    let mut bound = false;
+    for variant in bind_variants.iter() {
+        if run_qmicli(
+            &device,
+            &[&format!("--client-cid={cid}"), "--client-no-release-cid", variant],
+        )
+        .is_ok()
+        {
+            bound = true;
+            break;
+        }
+    }
+    if !bound {
+        tracing::warn!(
+            target: "simadmin::volte",
+            mux = cfg.mux,
+            "qmicli bind-mux 全部形态都被拒绝，按默认数据口继续"
+        );
+    }
+
+    // 3) 拉起 PDN。
     let network = format!(
-        "apn={},ip-type=6",
+        "apn={},ip-type={ip_type}",
         if cfg.apn.is_empty() { "ims" } else { cfg.apn.as_str() }
     );
     let start = format!("--wds-start-network={network}");
@@ -226,7 +301,7 @@ fn qmicli_bring_up(cfg: &BearerConfig) -> Result<BearerRaw, String> {
         return Err(format!("qmicli start-network 未确认: {}", first_line(&out)));
     }
 
-    // 3) 读动态参数。
+    // 4) 读动态参数。
     let settings = run_qmicli(
         &device,
         &[&format!("--client-cid={cid}"), "--client-no-release-cid", "--wds-get-current-settings"],
@@ -234,6 +309,10 @@ fn qmicli_bring_up(cfg: &BearerConfig) -> Result<BearerRaw, String> {
 
     let mut raw = parse_qmicli_settings(&settings);
     raw.pcscf_hint = parse_pcscf_lines(&settings);
+    if raw.local.is_none() {
+        // 拿到了 "network started" 但没地址（家族不匹配），交给上一层换家族重试。
+        return Err("qmicli 未拿到本机地址".to_string());
+    }
     Ok(raw)
 }
 
@@ -595,9 +674,86 @@ fn discover_pcscf_via_at(cfg: &BearerConfig) -> Vec<IpAddr> {
     }
 }
 
+/// 在 IMS 承载所在 /24 里探测 P-CSCF。
+///
+/// 做法：从承载自己的地址发出 SIP OPTIONS（源端口临时分配），先把整个 /24
+/// 打一遍再统一收包，谁回 `SIP/2.0` 就把它的源地址当作 P-CSCF。
+/// 254 个包、6 秒窗口，代价可以接受；IPv6 网段太大，不扫。
+fn probe_pcscf(local: IpAddr) -> Option<IpAddr> {
+    let candidates = scan_candidates(local);
+    if candidates.is_empty() {
+        return None;
+    }
+    let socket = match std::net::UdpSocket::bind(std::net::SocketAddr::new(local, 0)) {
+        Ok(socket) => socket,
+        Err(e) => {
+            tracing::warn!(target: "simadmin::volte", error = %e, "P-CSCF 探测：绑定本地地址失败");
+            return None;
+        }
+    };
+    let _ = socket.set_read_timeout(Some(Duration::from_millis(300)));
+    let local_port = socket.local_addr().map(|a| a.port()).unwrap_or(0);
+    let request = options_request(local, local_port);
+
+    for addr in &candidates {
+        let _ = socket.send_to(
+            request.as_bytes(),
+            std::net::SocketAddr::new(*addr, 5060),
+        );
+    }
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(6);
+    let mut buffer = [0u8; 4096];
+    while std::time::Instant::now() < deadline {
+        match socket.recv_from(&mut buffer) {
+            Ok((len, from)) => {
+                let text = String::from_utf8_lossy(&buffer[..len]);
+                if text.starts_with("SIP/2.0") {
+                    return Some(from.ip());
+                }
+            }
+            Err(_) => continue,
+        }
+    }
+    None
+}
+
+/// 承载地址所在 /24 的全部主机地址（去掉自己）。
+fn scan_candidates(local: IpAddr) -> Vec<IpAddr> {
+    let IpAddr::V4(v4) = local else {
+        return Vec::new();
+    };
+    let octets = v4.octets();
+    let mut out = Vec::with_capacity(254);
+    for host in 1u16..=254 {
+        if host as u8 == octets[3] {
+            continue;
+        }
+        out.push(IpAddr::V4(std::net::Ipv4Addr::new(
+            octets[0],
+            octets[1],
+            octets[2],
+            host as u8,
+        )));
+    }
+    out
+}
+
+fn options_request(local: IpAddr, port: u16) -> String {
+    format!(
+        "OPTIONS sip:pcscf SIP/2.0\r\n\
+         Via: SIP/2.0/UDP {local}:{port};branch=z9hG4bKprobe{port}\r\n\
+         Max-Forwards: 70\r\n\
+         From: <sip:probe@{local}>;tag=probe\r\n\
+         To: <sip:pcscf>\r\n\
+         Call-ID: probe-{port}@{local}\r\n\
+         CSeq: 1 OPTIONS\r\n\
+         Content-Length: 0\r\n\r\n"
+    )
+}
+
 /// 等待承载真正可用（地址出现在接口上）。
-pub fn wait_ready(bearer: &ImsBearer, timeout: Duration) -> bool {
-    let deadline = std::time::Instant::now() + timeout;
+pub fn wait_ready(bearer: &ImsBearer, timeout: Duration) -> bool {    let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
         if interface_has_address(&bearer.interface, bearer.local) {
             return true;
@@ -658,5 +814,28 @@ mod tests {
             parse_any_addr("36.8.129.66.96.1.0.1.0.0.0.0.0.0.0.0"),
             Some("2408:8142:6001:1::".parse::<IpAddr>().unwrap())
         );
+    }
+
+    #[test]
+    fn scan_covers_whole_slash24_without_self() {
+        let local: IpAddr = "10.140.149.124".parse().unwrap();
+        let list = scan_candidates(local);
+        assert_eq!(list.len(), 254);
+        assert!(!list.contains(&local), "不能把探测包发给自己");
+        assert!(list.contains(&"10.140.149.125".parse::<IpAddr>().unwrap()));
+        assert!(list.contains(&"10.140.149.1".parse::<IpAddr>().unwrap()));
+        assert!(list.contains(&"10.140.149.254".parse::<IpAddr>().unwrap()));
+        // IPv6 承载不扫（网段太大）
+        assert!(scan_candidates("2408:8456:435:f02d::1".parse().unwrap()).is_empty());
+    }
+
+    #[test]
+    fn options_request_is_well_formed() {
+        let local: IpAddr = "10.140.149.124".parse().unwrap();
+        let text = options_request(local, 47481);
+        assert!(text.starts_with("OPTIONS sip:pcscf SIP/2.0\r\n"));
+        assert!(text.contains("Via: SIP/2.0/UDP 10.140.149.124:47481;branch="));
+        assert!(text.contains("CSeq: 1 OPTIONS"));
+        assert!(text.ends_with("Content-Length: 0\r\n\r\n"));
     }
 }

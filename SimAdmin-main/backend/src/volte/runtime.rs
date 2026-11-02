@@ -416,7 +416,7 @@ pub async fn run(shared: Arc<Shared>, cfg: RuntimeConfig, mut commands: mpsc::Re
                         pcscf = %session.pcscf,
                         mode = session.mode.as_str(),
                         interface = %session.bearer.interface,
-                        "IMS 注册成功，短信通道已接管"
+                        "IMS REGISTER 200 OK — 短信通道已接管"
                     );
                     current = Some(session);
                     backoff = 2;

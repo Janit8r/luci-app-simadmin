@@ -525,6 +525,14 @@ fn wait_readable(fd: i32, timeout: Duration) -> Result<(), String> {
     Ok(())
 }
 
+/// 找 QMI 控制口。
+///
+/// 两代命名并存：
+///   - 老内核 / `qmi_wwan`：`/dev/cdc-wdm<N>`
+///   - 新 `wwan` 子系统（msm8916 的 `bam-dmux` 等）：`/dev/wwan<N>qmi<M>`
+///
+/// 设备实测（ImmortalWrt 7.3 / msm8916 / bam-dmux）只有 `wwan0qmi0`，
+/// 早期只扫 `cdc-wdm*` 会直接报 `volte_qmi_device_missing`。
 fn find_qmi_device() -> Option<String> {
     for index in 0..4 {
         let path = format!("/dev/cdc-wdm{index}");
@@ -532,7 +540,30 @@ fn find_qmi_device() -> Option<String> {
             return Some(path);
         }
     }
-    None
+
+    let mut found: Vec<(u32, u32, String)> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir("/dev") {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy().to_string();
+            if let Some((device, port)) = parse_wwan_qmi_name(&name) {
+                found.push((device, port, format!("/dev/{name}")));
+            }
+        }
+    }
+    // 编号排序，避免 read_dir 顺序不定时选到非主口。
+    found.sort();
+    found.into_iter().next().map(|(_, _, path)| path)
+}
+
+/// 解析 `wwan<N>qmi<M>` 形式的设备名，返回 `(N, M)`。
+fn parse_wwan_qmi_name(name: &str) -> Option<(u32, u32)> {
+    let rest = name.strip_prefix("wwan")?;
+    let (device, port) = rest.split_once("qmi")?;
+    if device.is_empty() || port.is_empty() {
+        return None;
+    }
+    Some((device.parse().ok()?, port.parse().ok()?))
 }
 
 // ---------------------------------------------------------------------------
@@ -597,6 +628,20 @@ mod tests {
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0], (0x01, vec![6]));
         assert_eq!(parsed[1], (0x31, vec![4]));
+    }
+
+    #[test]
+    fn wwan_qmi_device_names() {
+        // 设备实测：msm8916 + bam-dmux 只有 wwan 子系统命名
+        assert_eq!(parse_wwan_qmi_name("wwan0qmi0"), Some((0, 0)));
+        assert_eq!(parse_wwan_qmi_name("wwan1qmi0"), Some((1, 0)));
+        assert_eq!(parse_wwan_qmi_name("wwan0qmi1"), Some((0, 1)));
+        // AT 口、网络口、无关节点都不能被当成 QMI 控制口
+        assert_eq!(parse_wwan_qmi_name("wwan0at0"), None);
+        assert_eq!(parse_wwan_qmi_name("wwan0"), None);
+        assert_eq!(parse_wwan_qmi_name("cdc-wdm0"), None);
+        assert_eq!(parse_wwan_qmi_name("wwanqmi0"), None);
+        assert_eq!(parse_wwan_qmi_name("wwan0qmi"), None);
     }
 
     #[test]
