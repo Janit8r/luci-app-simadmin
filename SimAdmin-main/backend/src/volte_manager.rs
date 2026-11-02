@@ -543,6 +543,7 @@ mod tests {
                 roaming_allowed: None,
                 data_path_intent: None,
                 smsc: Some("abc".into()),
+                pcscf: None,
                 interface: None,
                 mux: None,
                 prefer_ipsec: None,
