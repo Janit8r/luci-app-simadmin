@@ -206,42 +206,142 @@ impl VolteManager {
         self.state.lock().await.set_stage("bearer");
         let bearer = connect_ims_bearer(conn, DEFAULT_IMS_APN, AddressFamily::V6).await?;
 
-        // 3. 地址下发——这一步缺失会让 SIP 完全发不出去
-        self.state.lock().await.set_stage("address");
-        bearer.apply().await?;
-        info!(
-            interface = %bearer.interface,
-            local_ip = %bearer.address,
-            mtu = ?bearer.mtu,
-            "IMS bearer configured"
-        );
+        // 3~5 步放在统一作用域里：任何一步失败都要把 MM 承载释放掉。
+        //
+        // 不释放的后果是真机上极难排查的现象——残留的 IMS PDN 会一直占着
+        // QMI 数据槽，下一次 CreateBearer 直接返回 `Call failed: unknown error`，
+        // 而日志里只会看到"承载建立失败"，完全看不出是上一次没清理。
+        let outcome: Result<(), crate::volte::VolteError> = async {
+            // 3. 地址下发——这一步缺失会让 SIP 完全发不出去
+            self.state.lock().await.set_stage("address");
+            bearer.apply().await?;
+            info!(
+                interface = %bearer.interface,
+                local_ip = %bearer.address,
+                mtu = ?bearer.mtu,
+                "IMS bearer configured"
+            );
 
-        // 4. P-CSCF
-        let pcscf = bearer
-            .pcscf
-            .first()
-            .cloned()
-            .ok_or_else(|| crate::volte::VolteError::new(codes::PCSCF_MISSING))?;
-        self.state.lock().await.mark_bearer_up(
-            &bearer.interface,
-            bearer.family.as_str(),
-            &bearer.address,
-            Some(&pcscf),
-            "secondary_qmi_data",
-        );
+            // 4. P-CSCF：优先用承载自带的值，没有就查 AT+CGCONTRDP
+            self.state.lock().await.set_stage("pcscf");
+            let pcscf = match bearer.pcscf.first().cloned() {
+                Some(p) => p,
+                None => discover_pcscf_via_at()
+                    .await
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| crate::volte::VolteError::new(codes::PCSCF_MISSING))?,
+            };
+            self.state.lock().await.mark_bearer_up(
+                &bearer.interface,
+                bearer.family.as_str(),
+                &bearer.address,
+                Some(&pcscf),
+                "secondary_qmi_data",
+            );
 
-        // 5. 注册（当前实现到明文 UDP 探测为止）
-        self.state.lock().await.set_stage("register");
-        debug!(pcscf = %pcscf, "starting SIP register");
-        let _ = &identity;
+            // 5. 注册（当前实现到明文 UDP 探测为止）
+            self.state.lock().await.set_stage("register");
+            debug!(pcscf = %pcscf, "starting SIP register");
+            let _ = &identity;
 
-        // 承载回收，避免占用 QMI 资源；注册成功路径下会保留
+            Err(crate::volte::VolteError::with_detail(
+                codes::UDP_RECV_TIMEOUT,
+                format!("registration not completed against {pcscf}"),
+            ))
+        }
+        .await;
+
+        // 无论成功失败，先撤掉接口上的地址/路由，再释放 MM 承载
         bearer.teardown().await;
+        if outcome.is_err() {
+            release_ims_bearer(conn, &bearer.object_path).await;
+        }
+        outcome
+    }
+}
 
-        Err(crate::volte::VolteError::with_detail(
-            codes::UDP_RECV_TIMEOUT,
-            format!("registration not completed against {pcscf}"),
-        ))
+/// 释放 ModemManager 里的承载对象。
+///
+/// 顺序：先 Disconnect 让模组回收 PDN，再 DeleteBearer 移除对象。
+/// 两步都尽力而为——即使 Disconnect 失败也要尝试删除，否则对象会一直
+/// 挂在 modem 上，后续 CreateBearer 会因为数据槽被占而失败。
+async fn release_ims_bearer(conn: &Connection, path: &str) {
+    let Ok(proxy) = Proxy::new(conn, MM_SERVICE, path, MM_BEARER).await else {
+        return;
+    };
+    if let Err(e) = proxy.call::<_, _, ()>("Disconnect", &()).await {
+        debug!(bearer = path, error = %e, "bearer disconnect failed");
+    }
+    // 给模组一点时间真正释放 PDN，再删对象
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    if let Ok(modem) = modem_manager::find_modem_path(conn).await {
+        if let Ok(modem_proxy) = Proxy::new(conn, MM_SERVICE, modem.as_str(), MM_MODEM).await {
+            let obj = zbus::zvariant::ObjectPath::try_from(path).ok();
+            if let Some(obj) = obj {
+                let _ = modem_proxy
+                    .call::<_, _, ()>("DeleteBearer", &(obj))
+                    .await;
+            }
+        }
+    }
+}
+
+/// 通过 `AT+CGCONTRDP` 读取 P-CSCF。
+///
+/// P-CSCF 不在 ModemManager 的承载属性里——它通过 QMI 的 PCO 或 DHCP
+/// 下发，MM 只记录"PCSCF Address Using PCO/DHCP"这两个标志位。而
+/// `AT+CGCONTRDP` 会直接给出每个上下文分配到的 P-CSCF 地址列表：
+///
+/// ```text
+/// +CGCONTRDP: 1,5,ims,2408:8556:420:9350::/64,2408:8556:420:9350::1,,,2408:8142:6001:603::
+/// ```
+///
+/// 第 8 个字段起是 P-CSCF（可能多个）。优先取 APN 为 `ims` 的那一行。
+async fn discover_pcscf_via_at() -> Vec<String> {
+    let output = match tokio::process::Command::new("mmcli")
+        .args(["-m", "any", "--command=AT+CGCONTRDP"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+    {
+        Ok(o) => o,
+        Err(_) => return Vec::new(),
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut fallback: Vec<String> = Vec::new();
+    let mut ims: Vec<String> = Vec::new();
+
+    for line in text.lines() {
+        let Some(idx) = line.find("+CGCONTRDP:") else {
+            continue;
+        };
+        let body = &line[idx + "+CGCONTRDP:".len()..];
+        let fields: Vec<&str> = body.split(',').map(|f| f.trim()).collect();
+        if fields.len() < 8 {
+            continue;
+        }
+        let apn = fields.get(2).copied().unwrap_or("");
+        let addrs: Vec<String> = fields[7..]
+            .iter()
+            .map(|s| s.trim_matches('"').trim())
+            .filter(|s| !s.is_empty() && s.contains(':'))
+            .map(|s| s.to_string())
+            .collect();
+        if addrs.is_empty() {
+            continue;
+        }
+        if apn.eq_ignore_ascii_case("ims") {
+            ims.extend(addrs);
+        } else if fallback.is_empty() {
+            fallback = addrs;
+        }
+    }
+
+    if !ims.is_empty() {
+        ims
+    } else {
+        fallback
     }
 }
 
