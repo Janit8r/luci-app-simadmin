@@ -284,6 +284,21 @@ fn qmicli_bring_up_family(cfg: &BearerConfig, ip_type: &str) -> Result<BearerRaw
     let out = run_qmicli(&device, &["--wds-noop", "--client-no-release-cid"])?;
     let cid = parse_qmicli_cid(&out).ok_or_else(|| "qmicli 未返回 CID".to_string())?;
 
+    // 1.5) 打开该 cid 的 P-CSCF 上报 —— 必须在 PDP 激活**之前**。
+    //
+    // 这是整个 P-CSCF 问题的真正答案。模组只在 Activate PDP Context Accept
+    // 的 PCO 里记录 P-CSCF，`AT$QCPDPIMSCFGE` 只是打开「记录开关」；
+    // 激活完成后再补发，不会回填任何东西。
+    //
+    // 联通实测对照（同一张卡、同一个 APN）：
+    //   先激活 → 后置位：AT+CGCONTRDP 只有 7 个字段，没有 P-CSCF
+    //   先置位 → 后激活：第 8/9 字段立刻出现
+    //       +CGCONTRDP: 2,11,ims,<local>,<gw>,,,
+    //           36.8.129.66.96.1.16.7.0.0.0.0.0.0.0.1,   -> 2408:8142:6001:1007::1
+    //           36.8.129.66.96.1.6.3.0.0.0.0.0.0.0.0      -> 2408:8142:6001:603::
+    // 顺序错了就永远拿不到，而且不会报错，只会静默地少两个字段。
+    enable_pcscf_reporting(cid);
+
     // 2) 绑定 mux。
     //
     // bam-dmux / qmap 设备上默认数据口已经占用了「未绑定」的通道，此时直接
@@ -721,13 +736,48 @@ fn run_ip(ip: &str, args: &[String]) -> Result<bool, String> {
     Ok(false)
 }
 
+/// 在 PDP 激活**之前**打开该 cid 的 P-CSCF 上报。
+///
+/// 单独抽出来是因为时序比命令本身重要得多：模组只在 Activate PDP Context
+/// Accept 的 PCO 里记录 P-CSCF，`AT$QCPDPIMSCFGE` 只是打开「记录开关」。
+/// 激活完再补发不会回填，`AT+CGCONTRDP` 依旧只有 7 个字段。
+///
+/// 失败只记日志、不返回错误：这条命令在部分 cid / 部分 IP 族上会被固件拒
+/// （实测 IPV6-only 的 cid 5 连 `AT+CGACT` 都报 Unknown error），不能因为
+/// 拿不到一个「额外信息」就让整个 IMS 承载建不起来。
+fn enable_pcscf_reporting(cid: u8) {
+    let cmd = pcscf::at_enable_pcscf_reporting(cid as u32);
+    match Command::new("mmcli")
+        .args(["-m", "any", &format!("--command={cmd}")])
+        .output()
+    {
+        Ok(out) if out.status.success() => {
+            tracing::debug!(target: "simadmin::volte", cid, "已打开 P-CSCF 上报");
+        }
+        Ok(out) => {
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            tracing::debug!(
+                target: "simadmin::volte",
+                cid,
+                err = %first_line(stderr.trim()),
+                "打开 P-CSCF 上报失败，继续"
+            );
+        }
+        Err(e) => {
+            tracing::debug!(target: "simadmin::volte", cid, err = %e, "mmcli 不可用，跳过 P-CSCF 上报");
+        }
+    }
+}
+
 /// 通过 ModemManager 的 AT 通道读 `+CGCONTRDP` 里的 P-CSCF（有 MM 时最准）。
 ///
 /// 高通模组默认**不在** `+CGCONTRDP` 里带 P-CSCF 字段，必须先打开上报：
-/// `AT$QCPDPIMSCFGE=<cid>,1,1,1`。这一步在参考实现（`ims/pcscf.rs`）里是有的，
-/// 但之前的 SimAdmin 版本只定义了函数、从来没调用过，所以永远读不到。
+/// `AT$QCPDPIMSCFGE=<cid>,1,1,1`，而且要在激活之前（见
+/// [`enable_pcscf_reporting`]）。
 ///
-/// cid 是 PDP 上下文号，不知道运营商给 IMS 分配了哪个，逐个试 1..=4。
+/// 这里的「激活后逐 cid 扫一遍」只作为兜底：它能读到**由 AT 激活**的上下
+/// 文，读不到纯 QMI 拉起的会话（实测 QMI 会话根本不出现在 `+CGCONTRDP`
+/// 里）。所以真正的主力是激活前的置位。
 fn discover_pcscf_via_at(cfg: &BearerConfig) -> Vec<IpAddr> {
     if cfg.pcscf.is_some() {
         return Vec::new();
