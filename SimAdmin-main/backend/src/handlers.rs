@@ -3874,6 +3874,24 @@ pub async fn set_volte_settings_handler(
     }
 }
 
+/// POST /api/volte/discover-pcscf —— AT 激活一次 IMS 上下文，学习 P-CSCF。
+///
+/// 本网 P-CSCF 只能这样拿到：QMI 不下发 0x1F TLV、公网 DNS 不发布
+/// 3gppnetwork.org 的记录、`AT+CGCONTRDP` 又只对 AT 激活的上下文吐字段。
+/// 学到之后写进 `volte.pcscf`，承载仍走 QMI。
+pub async fn discover_volte_pcscf_handler(State(state): State<AppState>) -> impl IntoResponse {
+    match state.volte_manager.discover_pcscf().await {
+        Ok(list) => (
+            StatusCode::OK,
+            Json(ApiResponse::success_with_message("Success", list)),
+        ),
+        Err(error) => (
+            StatusCode::OK,
+            Json(ApiResponse::<Vec<String>>::error(error)),
+        ),
+    }
+}
+
 /// POST /api/volte/connection —— 旧前端的「VoLTE 连接」开关。
 ///
 /// 原生栈里连接与主开关同源：开 = 启动运行时并注册，关 = 停止运行时。

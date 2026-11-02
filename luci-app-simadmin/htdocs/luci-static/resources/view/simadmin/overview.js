@@ -191,6 +191,35 @@ function act(path, body) {
  *
  * 留空 = 回到自动发现。
  */
+/*
+ * 自动探测 P-CSCF：让后端通过 AT 激活一次 IMS 上下文，把网络在 PCO 里
+ * 下发的地址读出来写进配置。
+ *
+ * 这条路径慢（要真的激活一个 PDP 上下文，20~30 秒）而且会短暂中断 IMS
+ * 承载，所以做成手动触发，不在每次刷新时自动跑。
+ */
+function discoverPcscf(onDone) {
+	if (busy)
+		return;
+	busy = true;
+	ui.addNotification(null, E('p', {}, [
+		'正在通过 AT 激活 IMS 上下文学习 P-CSCF，约需 20~30 秒…'
+	]), 'info');
+	call('POST', 'discover-pcscf', {}).then(function(list) {
+		var found = (Array.isArray(list) ? list.join('、') : '');
+		ui.addNotification(null, E('p', {}, [
+			'已学到 P-CSCF：' + (found || '（空）') + '，已写入配置'
+		]), 'info');
+		if (onDone)
+			onDone(found);
+		return pollStatus();
+	}).catch(function(err) {
+		ui.addNotification(null, E('p', {}, ['P-CSCF 探测失败: ' + err.message]), 'error');
+	}).finally(function() {
+		busy = false;
+	});
+}
+
 function editPcscf(cfg) {
 	var input = E('input', {
 		'class': 'cbi-input-text',
@@ -210,6 +239,11 @@ function editPcscf(cfg) {
 			var v = (input.value || '').trim();
 			ui.hideModal();
 			act('settings', { pcscf: v });
+		}),
+		button('自动探测', '', false, function() {
+			// 探测会重建承载，弹窗留着没意义，先关掉。
+			ui.hideModal();
+			discoverPcscf();
 		}),
 		button('取消', '', false, function() {
 			ui.hideModal();

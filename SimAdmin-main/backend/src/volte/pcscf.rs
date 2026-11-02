@@ -170,6 +170,41 @@ pub fn collect_cgcontrdp_pcscf(response: &str) -> Vec<IpAddr> {
     out
 }
 
+/// 只取**指定 cid** 那一行的 P-CSCF。
+///
+/// `AT+CGCONTRDP` 会把所有已激活的上下文都列出来，默认承载那行也带第 8/9
+/// 字段，而且经常是脏数据（DNS2 后面黏了一段 IPv6 尾串）。做「按 cid 学习
+/// P-CSCF」时不能像 [`collect_cgcontrdp_pcscf`] 那样全收，必须锁定 cid。
+pub fn collect_cgcontrdp_pcscf_for_cid(response: &str, cid: u32) -> Vec<IpAddr> {
+    for line in response.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("+CGCONTRDP:") else {
+            continue;
+        };
+        let fields: Vec<&str> = rest.split(',').map(str::trim).collect();
+        let Some(first) = fields.first() else {
+            continue;
+        };
+        if first.trim_matches('"').parse::<u32>().ok() != Some(cid) {
+            continue;
+        }
+        let mut out: Vec<IpAddr> = Vec::new();
+        for f in fields.iter().skip(7) {
+            let f = f.trim().trim_matches('"');
+            if f.is_empty() || f.contains(char::is_whitespace) {
+                continue;
+            }
+            if let Some(a) = parse_at_addr(f) {
+                if !out.contains(&a) {
+                    out.push(a);
+                }
+            }
+        }
+        return out;
+    }
+    Vec::new()
+}
+
 /// Decode an AT-style address.
 ///
 /// Handles three shapes:
@@ -418,6 +453,42 @@ OK";
         // 联通实测的真实返回：只有 7 个字段，第 8 个 P-CSCF 不存在。
         let resp = "+CGCONTRDP: 3,7,ims.epc.mnc001.mcc460.gprs,36.8.132.86.4.51.143.3.0.0.0.0.0.0.0.1, 128.0.0.0.0.0.0.0.0.0.0.0.0.0.2.0, 8.136.136.0.0.136.136.0.0.0.0.0.0.0.8.36, 8.136.153.0.0.136.153.0.0.0.0.0.0.0.8.254";
         assert!(collect_cgcontrdp_pcscf(resp).is_empty());
+    }
+
+    #[test]
+    fn cid_filter_picks_only_the_ims_line() {
+        // 真实抓包：默认承载那行的第 8 字段是脏数据（DNS2 黏了 IPv6 尾串），
+        // 只有 cid=2 那行才是真正的 IMS 上下文，第 8/9 字段是 P-CSCF。
+        // 按 cid 学习时必须只认这一行，不能像 collect_cgcontrdp_pcscf 那样全收。
+        let resp = "+CGCONTRDP: 1,5,3gnet,10.41.44.222,36.8.132.86.4.48.50.145.0.0.0.0.0.0.0.1, 128.0.0.0.0.0.0.0.0.0.0.0.0.0.2.0,120.80.80.80 8.136.136.0.0.136.136.0.0.0.0.0.0.0.8.36,221.5.88.88 8.136.153.0.0.136.153.0.0.0.0.0.0.0.8.254
++CGCONTRDP: 2,11,ims,36.8.133.86.4.53.243.127.0.0.0.0.0.0.0.1, 128.0.0.0.0.0.0.0.0.0.0.0.0.0.2.0,,,36.8.129.66.96.1.16.7.0.0.0.0.0.0.0.1,36.8.129.66.96.1.6.3.0.0.0.0.0.0.0.0";
+
+        let ims = collect_cgcontrdp_pcscf_for_cid(resp, 2);
+        assert_eq!(ims.len(), 2, "实际: {ims:?}");
+        assert_eq!(ims[0], "2408:8142:6001:1007::1".parse::<IpAddr>().unwrap());
+        assert_eq!(ims[1], "2408:8142:6001:603::".parse::<IpAddr>().unwrap());
+
+        // 默认承载那一行绝不能贡献任何 P-CSCF。
+        assert!(collect_cgcontrdp_pcscf_for_cid(resp, 1).is_empty());
+        // 不存在的 cid 也一样。
+        assert!(collect_cgcontrdp_pcscf_for_cid(resp, 9).is_empty());
+    }
+
+    #[test]
+    fn cid_filter_handles_the_mmcli_response_wrapper() {
+        // mmcli --command 的输出形如 `response: '....'`，第一行带前缀。
+        // 剥掉前缀之后解析必须照样能命中第一行。
+        let raw = "response: '+CGCONTRDP: 6,12,ims,36.8.133.86.4.53.243.127.0.0.0.0.0.0.0.1, 128.0.0.0.0.0.0.0.0.0.0.0.0.0.2.0,,,36.8.129.66.96.1.16.7.0.0.0.0.0.0.0.1'";
+        let payload = raw
+            .trim()
+            .strip_prefix("response:")
+            .unwrap()
+            .trim()
+            .trim_start_matches('\'')
+            .trim_end_matches('\'');
+        let list = collect_cgcontrdp_pcscf_for_cid(payload, 6);
+        assert_eq!(list.len(), 1, "实际: {list:?}");
+        assert_eq!(list[0], "2408:8142:6001:1007::1".parse::<IpAddr>().unwrap());
     }
 
     #[test]

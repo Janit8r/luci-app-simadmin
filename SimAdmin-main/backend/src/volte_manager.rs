@@ -190,6 +190,75 @@ impl VolteManager {
         Ok(())
     }
 
+    /// 通过 AT 激活一次 IMS 上下文，学习网络下发的 P-CSCF，并写回配置。
+    ///
+    /// 为什么要拆成「学一次再注入」：
+    ///   本网 P-CSCF 只能从 **AT 激活** 的上下文里读到（`AT+CGCONTRDP` 的第
+    ///   8/9 字段），而承载又必须走 QMI —— AT 激活在 bam-dmux 上没有 mux
+    ///   bind，数据面是死的。两者不能同时满足，所以分两步：AT 学地址 →
+    ///   写进 `volte.pcscf` → QMI 建承载时直接用这个地址。
+    ///
+    /// 学之前要先停掉运行时：QMI 那条 IMS 承载还占着同一个 APN 的话，再 AT
+    /// 激活一个会被网络以 `CallFailed` 拒掉（实测）。
+    pub async fn discover_pcscf(&self) -> Result<Vec<String>, String> {
+        let cfg = self.config_manager.get_volte_config();
+        let apn = if cfg.apn.trim().is_empty() {
+            "ims".to_string()
+        } else {
+            cfg.apn.clone()
+        };
+
+        // 用哪个 cid 去「借」一个上下文来学地址：不能拍一个固定值。
+        // 1 是默认承载；2..=5 会被厂商 qmi-modem-410-init 在 ufi-wf2 上删掉，
+        // 而且可能有 QMI 客户端占着（占着时 AT+CGACT 直接报 Unknown error）。
+        // 所以按顺序试，哪个能激活就用哪个。
+        const LEARN_CIDS: [u32; 3] = [4, 5, 6];
+
+        if cfg.feature_enabled {
+            self.stop_worker().await;
+        }
+
+        let mut last_err = String::from("没有可用的 PDP 上下文号");
+        let mut learned: Option<Vec<std::net::IpAddr>> = None;
+        for cid in LEARN_CIDS {
+            match crate::volte::bearer::learn_pcscf_via_at(&apn, cid) {
+                Ok(list) if !list.is_empty() => {
+                    learned = Some(list);
+                    break;
+                }
+                Ok(_) => {
+                    // 激活成功但网络没下发 P-CSCF，换 cid 也没用，直接停。
+                    last_err = "网络没有在 PCO 里下发 P-CSCF（AT+CGCONTRDP 里没有第 8/9 字段）"
+                        .to_string();
+                    break;
+                }
+                Err(e) => {
+                    last_err = e;
+                }
+            }
+        }
+
+        let result = match learned {
+            Some(list) => {
+                let mut updated = cfg.clone();
+                updated.pcscf = list[0].to_string();
+                match self.config_manager.set_volte_config(updated) {
+                    Ok(()) => Ok(list.iter().map(|a| a.to_string()).collect()),
+                    Err(e) => Err(format!("保存 P-CSCF 失败: {e}")),
+                }
+            }
+            None => Err(last_err),
+        };
+
+        // 不管学没学到，都把运行时拉回来 —— 不能让用户点一下按钮之后
+        // IMS 就停在那儿了。
+        if cfg.feature_enabled {
+            self.start_worker().await;
+        }
+
+        result
+    }
+
     // -----------------------------------------------------------------------
     // 控制
     // -----------------------------------------------------------------------

@@ -769,6 +769,72 @@ fn enable_pcscf_reporting(cid: u8) {
     }
 }
 
+/// 把 `mmcli --command` 的输出还原成纯 AT 响应。
+///
+/// mmcli 打的是 `response: '<多行响应>'`：多行时只有**第一行**带前缀，最后
+/// 一行带收尾的单引号。不剥掉的话按行匹配 `+CGCONTRDP:` 会漏掉第一行，
+/// 而 IMS 上下文恰好经常就在第一行。
+fn at_payload(raw: &str) -> String {
+    let mut s = raw.trim();
+    if let Some(rest) = s.strip_prefix("response:") {
+        s = rest.trim();
+    }
+    s.trim_start_matches('\'').trim_end_matches('\'').to_string()
+}
+
+fn mmcli_at(cmd: &str) -> Result<String, String> {
+    let out = Command::new("mmcli")
+        .args(["-m", "any", &format!("--command={cmd}")])
+        .output()
+        .map_err(|e| format!("mmcli 不可用: {e}"))?;
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+    if !out.status.success() {
+        let msg = if stderr.trim().is_empty() { &stdout } else { &stderr };
+        return Err(format!("{cmd} 失败: {}", first_line(msg.trim())));
+    }
+    Ok(at_payload(&stdout))
+}
+
+/// 通过 AT 激活一次 IMS 上下文，把网络在 PCO 里下发的 P-CSCF 读出来，再拆掉。
+///
+/// 这是本网**唯一**能拿到 P-CSCF 的路径。三条自动发现的路都断了：
+///   - QMI `--wds-get-current-settings` 没有 0x1F（P-CSCF）TLV
+///   - 公网 DNS 不发布 `pcscf.*.3gppnetwork.org`，而且那台 DNS 对任意不存在
+///     的域名也回 NOERROR/0，结果不可信
+///   - `AT+CGCONTRDP` 只对 **AT 激活** 的上下文吐 P-CSCF；纯 QMI 拉起的会话
+///     根本不出现在这个命令里
+///
+/// 两个必须守住的时序：
+///   1. `AT$QCPDPIMSCFGE` 必须在 `AT+CGACT` **之前**。模组只在 Activate PDP
+///      Context Accept 的 PCO 里记录 P-CSCF，事后置位不会回填（实测：先激活
+///      后置位只有 7 个字段，先置位后激活立刻多出第 8/9 字段）。
+///   2. 读完必须 `AT+CGACT=0` 拆掉。否则后面 QMI 再拉同一个 APN 会被
+///      `CallFailed` 拒掉（实测）。
+pub fn learn_pcscf_via_at(apn: &str, cid: u32) -> Result<Vec<IpAddr>, String> {
+    let apn = apn.trim();
+    if apn.is_empty() {
+        return Err("APN 为空，无法激活 IMS 上下文".to_string());
+    }
+
+    // 清掉可能残留的上下文，避免 CGACT 直接报错。
+    let _ = mmcli_at(&format!("AT+CGACT=0,{cid}"));
+
+    mmcli_at(&format!("AT+CGDCONT={cid},\"IPV4V6\",\"{apn}\""))?;
+    mmcli_at(&pcscf::at_enable_pcscf_reporting(cid))?;
+
+    let learned = (|| -> Result<Vec<IpAddr>, String> {
+        mmcli_at(&format!("AT+CGACT=1,{cid}"))?;
+        let resp = mmcli_at("AT+CGCONTRDP")?;
+        Ok(pcscf::collect_cgcontrdp_pcscf_for_cid(&resp, cid))
+    })();
+
+    // 无论成功与否都要拆掉，别把上下文留给后面的 QMI 会话。
+    let _ = mmcli_at(&format!("AT+CGACT=0,{cid}"));
+
+    learned
+}
+
 /// 通过 ModemManager 的 AT 通道读 `+CGCONTRDP` 里的 P-CSCF（有 MM 时最准）。
 ///
 /// 高通模组默认**不在** `+CGCONTRDP` 里带 P-CSCF 字段，必须先打开上报：

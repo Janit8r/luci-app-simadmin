@@ -839,6 +839,10 @@ async fn main() -> Result<()> {
             post(set_volte_settings_handler).options(options_handler),
         )
         .route(
+            "/api/volte/discover-pcscf",
+            post(discover_volte_pcscf_handler).options(options_handler),
+        )
+        .route(
             "/api/volte/refresh",
             post(refresh_volte_handler).options(options_handler),
         )
