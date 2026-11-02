@@ -67,6 +67,20 @@ ims_wait_done() {
 	[ "$s" -ge "$WAIT_IMS" ]
 }
 
+# IMS 运行时是否已经有结论（注册成功 / 失败 / 未启用）。
+#
+# 有结论就不必再等：IMS 失败后它自己会退避重试，而这里干等只会把默认数据
+# 连接一起拖住。实测联通拿不到 P-CSCF，运行时会在 20 秒内落到 failed，
+# 没有这个判断就要白等满 WAIT_IMS（默认 600s）才有网。
+ims_settled() {
+	p=$(curl -s --max-time 3 http://127.0.0.1:3000/api/volte/control 2>/dev/null |
+		jsonfilter -e '@.data.runtime.phase' 2>/dev/null)
+	case "$p" in
+	registered | failed | disabled) return 0 ;;
+	*) return 1 ;;
+	esac
+}
+
 bearer_ids() {
 	mmcli -m any 2>/dev/null |
 		sed -n 's#.*Bearers *| */org/freedesktop/ModemManager1/Bearer/\([0-9][0-9]*\).*#\1#p'
@@ -122,11 +136,14 @@ connect() {
 
 run_once() {
 	if volte_enabled && ! ims_ok; then
-		if ! ims_wait_done; then
+		if ims_settled; then
+			log "ims settled, bring up data"
+		elif ! ims_wait_done; then
 			log "wait ims"
 			return 1
+		else
+			log "ims timeout"
 		fi
-		log "ims timeout"
 	fi
 
 	if data_ok; then
