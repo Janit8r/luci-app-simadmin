@@ -35,7 +35,6 @@ use crate::volte::runtime::RuntimeState;
 use crate::volte::{codes, Phase};
 
 const MM_SERVICE: &str = "org.freedesktop.ModemManager1";
-const DBUS_PROPERTIES: &str = "org.freedesktop.DBus.Properties";
 const MM_MODEM: &str = "org.freedesktop.ModemManager1.Modem";
 const MM_BEARER: &str = "org.freedesktop.ModemManager1.Bearer";
 
@@ -314,31 +313,26 @@ async fn connect_ims_bearer(
             crate::volte::VolteError::with_detail(codes::ADDRESS_MISSING, format!("interface: {e}"))
         })?;
 
-    // Ip4Config / Ip6Config 是 a{sv}
-    let prop_name = match family {
-        AddressFamily::V4 => "Ip4Config",
-        AddressFamily::V6 => "Ip6Config",
-    };
-    let cfg: HashMap<String, zbus::zvariant::OwnedValue> =
-        bearer_proxy.get_property(prop_name).await.map_err(|e| {
-            crate::volte::VolteError::with_detail(
-                codes::ADDRESS_MISSING,
-                format!("{prop_name}: {e}"),
-            )
-        })?;
+    // 承载配置改从 mmcli 的文本输出读取。
+    //
+    // MM 的 Ip4Config / Ip6Config 是 `a{sv}`，值类型混杂（字符串、整数、
+    // 字符串数组），经 zvariant 转换后容易丢字段；而 `mmcli -m any -b N`
+    // 的输出格式稳定、字段名固定，解析起来更可靠，也和运维手工排查时
+    // 看到的信息一致。
+    let index = bearer_index_from_path(&bearer_path);
+    let cfg = read_bearer_config_mmcli(index).await?;
 
-    let flat = flatten_ip_config(&cfg);
-    let address = flat
+    let address = cfg
         .get("address")
         .cloned()
         .ok_or_else(|| crate::volte::VolteError::new(codes::ADDRESS_MISSING))?;
-    let prefix: u8 = flat
+    let prefix: u8 = cfg
         .get("prefix")
         .and_then(|v| v.parse().ok())
         .unwrap_or(if family == AddressFamily::V6 { 64 } else { 32 });
-    let gateway = flat.get("gateway").cloned().filter(|g| !g.is_empty());
-    let mtu: Option<u32> = flat.get("mtu").and_then(|v| v.parse().ok());
-    let pcscf = bearer::extract_pcscf(&flat);
+    let gateway = cfg.get("gateway").cloned().filter(|g| !g.is_empty());
+    let mtu: Option<u32> = cfg.get("mtu").and_then(|v| v.parse().ok());
+    let pcscf = bearer::extract_pcscf(&cfg);
 
     Ok(ImsBearer {
         object_path: bearer_path,
@@ -352,43 +346,61 @@ async fn connect_ims_bearer(
     })
 }
 
-/// 把 MM 的 `a{sv}` IpConfig 压平成 `String -> String`，便于解析。
-fn flatten_ip_config(
-    cfg: &HashMap<String, zbus::zvariant::OwnedValue>,
-) -> HashMap<String, String> {
-    let mut out = HashMap::new();
-    for (k, v) in cfg {
-        let rendered = render_value(v);
-        if let Some(s) = rendered {
-            out.insert(k.clone(), s);
-        }
-    }
-    out
+/// 从 `/org/freedesktop/ModemManager1/Bearer/6` 取出序号 6。
+fn bearer_index_from_path(path: &str) -> u32 {
+    path.rsplit('/').next().and_then(|s| s.parse().ok()).unwrap_or(0)
 }
 
-/// 把 zvariant 值渲染成字符串；数组按逗号连接。
+/// 解析 `mmcli -m any -b <n>` 的输出。
 ///
-/// 走 serde 中转而不是逐个 `Value` 变体匹配：MM 的 IpConfig 是 `a{sv}`，
-/// 里面既有字符串也有整数和字符串数组，用 JSON 视图统一处理最省事。
-fn render_value(value: &zbus::zvariant::OwnedValue) -> Option<String> {
-    let json = serde_json::to_value(value).ok()?;
-    json_scalar_to_string(&json)
-}
-
-fn json_scalar_to_string(v: &serde_json::Value) -> Option<String> {
-    match v {
-        serde_json::Value::String(s) => Some(s.clone()),
-        serde_json::Value::Number(n) => Some(n.to_string()),
-        serde_json::Value::Array(items) => {
-            let parts: Vec<String> = items.iter().filter_map(json_scalar_to_string).collect();
-            Some(parts.join(","))
-        }
-        _ => None,
+/// 典型片段：
+/// ```text
+///   Status             |      connected: yes
+///                      |      interface: wwan0
+///   Properties         |            apn: ims
+///                      |        ip type: ipv6
+///                      |        address: 2408:8556:...
+///                      |         prefix: 64
+///                      |        gateway: 2408:8556:...
+///                      |            mtu: 1432
+/// ```
+async fn read_bearer_config_mmcli(
+    index: u32,
+) -> Result<HashMap<String, String>, crate::volte::VolteError> {
+    let output = tokio::process::Command::new("mmcli")
+        .args(["-m", "any", "-b", &index.to_string()])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .map_err(|e| {
+            crate::volte::VolteError::with_detail(codes::COMMAND_FAILED, format!("mmcli: {e}"))
+        })?;
+    if !output.status.success() {
+        return Err(crate::volte::VolteError::with_detail(
+            codes::COMMAND_FAILED,
+            "mmcli bearer query failed",
+        ));
     }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut out = HashMap::new();
+    for line in text.lines() {
+        // 只取 `key: value` 形态，跳过分隔线与分组标题
+        let Some((left, right)) = line.split_once(':') else {
+            continue;
+        };
+        let key = left
+            .rsplit('|')
+            .next()
+            .unwrap_or(left)
+            .trim()
+            .to_ascii_lowercase();
+        let value = right.trim().to_string();
+        if key.is_empty() || value.is_empty() {
+            continue;
+        }
+        // 首次出现优先，避免后面 Stats 段同名字段覆盖
+        out.entry(key).or_insert(value);
+    }
+    Ok(out)
 }
 
-/// 让编译器确认 DBUS_PROPERTIES 常量仍被引用（保留给后续属性读取使用）。
-#[allow(dead_code)]
-fn _properties_interface() -> &'static str {
-    DBUS_PROPERTIES
-}
