@@ -634,3 +634,49 @@ jobs:
               with open(step_summary, 'a', encoding='utf-8') as f:
                   f.write(summary)
           EOF
+
+  # 供固件仓库（wm-msm8906）拉取的预编译产物。
+  #
+  # 上游发布那一步需要 3899/SimAdmin 的写权限，这里没有，所以用 always()
+  # 保证即使上游发布失败，仍然能产出固件集成用的包。
+  # 使用固定 tag `prebuilt` 做滚动更新，固件侧 URL 不需要随版本变化。
+  publish-prebuilt:
+    name: Publish prebuilt for firmware
+    needs: [prepare, build]
+    if: always() && needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download aarch64 OTA artifact
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ota-*-aarch64
+          path: prebuilt
+          merge-multiple: true
+
+      - name: Upload rolling prebuilt release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          ls -la prebuilt
+          SRC=$(ls prebuilt/*.tar.gz | head -1)
+          cp "$SRC" prebuilt/simadmin-aarch64.tar.gz
+
+          mkdir -p check
+          tar xzf prebuilt/simadmin-aarch64.tar.gz -C check
+          ls -la check
+          if grep -qa 'UPX!' check/simadmin; then
+            echo "binary is UPX-packed"
+          else
+            echo "::warning::binary is NOT UPX-packed (use_upx=false?)"
+          fi
+
+          if ! gh release view prebuilt --repo "$REPO" >/dev/null 2>&1; then
+            gh release create prebuilt --repo "$REPO" \
+              --title "Prebuilt (rolling)" \
+              --notes "供固件仓库 wm-msm8906 构建时拉取的预编译产物。每次构建覆盖，URL 固定。" \
+              --prerelease
+          fi
+          gh release upload prebuilt prebuilt/simadmin-aarch64.tar.gz --clobber --repo "$REPO"
+          echo "published: https://github.com/$REPO/releases/download/prebuilt/simadmin-aarch64.tar.gz"
