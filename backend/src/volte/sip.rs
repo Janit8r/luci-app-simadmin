@@ -162,7 +162,16 @@ pub struct RegisterContext<'a> {
 }
 
 /// 构造完整的 REGISTER 报文。
+///
+/// `security_verify` 存在时视为「认证后的第二次 REGISTER」，会走精简模式。
+///
+/// 精简的原因是硬约束：IMS 承载的 MTU 只有 1432，而 IPsec 封装后一旦超过
+/// 这个值就会被 IPv6 分片，P-CSCF 对分片的 ESP 包直接静默丢弃（实测抓包
+/// 能看到 `frag (0|1384) ESP ...` 然后毫无响应）。所以第二次 REGISTER 必须
+/// 裁掉非必需头部，保证整包能装进一个 MTU。
 pub fn build_register(ctx: &RegisterContext<'_>) -> String {
+    let compact = ctx.security_verify.is_some();
+
     let contact = format!(
         "<sip:{}@[{}]:{};transport=UDP>;+g.3gpp.accesstype=\"3GPP-E-UTRAN-FDD\";+g.3gpp.smsip;expires=3600",
         user_part(ctx.impu),
@@ -187,6 +196,11 @@ pub fn build_register(ctx: &RegisterContext<'_>) -> String {
         msg.push_str(&format!("Authorization: {}\r\n", auth));
     }
     msg.push_str(&format!("Contact: {}\r\n", contact));
+    // Security-Client 在**每个** REGISTER 里都必须带（RFC 3329）。
+    //
+    // P-CSCF 靠它知道 UE 提议的 spi-c/spi-s 与 port-c/port-s，据此建自己的
+    // 入向 SA。精简模式下把它省掉会让 P-CSCF 无法匹配 SA，加密 REGISTER
+    // 被静默丢弃——抓包只有 Out 没有 In。
     if let Some(sc) = ctx.security_client.as_deref().filter(|s| !s.is_empty()) {
         msg.push_str(&format!("Security-Client: {}\r\n", sc));
     }
@@ -195,20 +209,28 @@ pub fn build_register(ctx: &RegisterContext<'_>) -> String {
     }
     msg.push_str("Accept-Contact: *;+g.3gpp.smsip\r\n");
     msg.push_str("Accept: application/vnd.3gpp.sms\r\n");
-    msg.push_str(&format!(
-        "Route: <sip:[{}]:5060;lr>\r\n",
-        ctx.pcscf
-    ));
+    // 精简模式下请求直接发到 P-CSCF 的 IP:9900，不需要 Route
+    if !compact {
+        msg.push_str(&format!("Route: <sip:[{}]:5060;lr>\r\n", ctx.pcscf));
+    }
     msg.push_str("Expires: 3600\r\n");
-    msg.push_str("Supported: path, gruu\r\n");
-    msg.push_str("Allow: INVITE,ACK,CANCEL,BYE,UPDATE,PRACK,MESSAGE,REFER,NOTIFY,INFO,OPTIONS\r\n");
-    msg.push_str(&format!("P-Preferred-Identity: <{}>\r\n", ctx.impu));
-    msg.push_str(&format!(
-        "P-Visited-Network-ID: \"{}\"\r\n",
-        ctx.home_domain
-    ));
-    msg.push_str(&format!("P-Access-Network-Info: {}\r\n", ctx.access_info));
-    msg.push_str("User-Agent: SimAdmin VoLTE\r\n");
+    // `sec-agree` 必须出现在 Require / Proxy-Require 里，而不只是 Supported。
+    // 中国联通的 P-CSCF 强制 IPsec AKA：只在 Supported 里声明会被判为
+    // "Without sec-agree and IPsecAKA is force on"，直接回
+    // `420 Bad Extension` + `Unsupported: sec-agree`，不下发 401 挑战。
+    msg.push_str("Require: sec-agree\r\n");
+    msg.push_str("Proxy-Require: sec-agree\r\n");
+    msg.push_str("Supported: path, sec-agree\r\n");
+    if !compact {
+        msg.push_str("Allow: INVITE,ACK,BYE,CANCEL,MESSAGE,OPTIONS\r\n");
+        msg.push_str(&format!("P-Preferred-Identity: <{}>\r\n", ctx.impu));
+        msg.push_str(&format!("P-Access-Network-Info: {}\r\n", ctx.access_info));
+        msg.push_str("User-Agent: SimAdmin\r\n");
+    } else {
+        // 精简模式只保留接入类型，去掉 cell-id 与 User-Agent，
+        // 为 Security-Client 腾出空间（ESP 后总长必须 ≤ MTU）。
+        msg.push_str("P-Access-Network-Info: 3GPP-E-UTRAN-FDD\r\n");
+    }
     msg.push_str("Content-Length: 0\r\n");
     msg.push_str("\r\n");
     msg

@@ -32,9 +32,11 @@ pub mod aka;
 pub mod bearer;
 pub mod identity;
 pub mod ipsec;
+pub mod register;
 pub mod runtime;
 pub mod sip;
 pub mod sms;
+pub mod transport;
 
 /// IMS 运行时状态机的粗粒度阶段。
 ///

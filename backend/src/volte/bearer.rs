@@ -26,6 +26,13 @@ use crate::volte::{codes, VolteError};
 pub enum AddressFamily {
     V4,
     V6,
+    /// 双栈请求，但只使用分配到的 IPv6 地址。
+    ///
+    /// 必须用这个而不是纯 `V6`：这台模组对纯 IPv6 的 IMS PDN 只会在
+    /// 默认通道上建一条"看起来连上了"的 PDN，拿得到地址但数据面完全不通
+    /// （连网关都 ping 不到）。请求 `ipv4v6` 时 ModemManager 才会给这个
+    /// PDN 分配独立的 mux 通道（wwan1），数据面才真正通。
+    V4V6,
 }
 
 impl AddressFamily {
@@ -33,6 +40,7 @@ impl AddressFamily {
         match self {
             AddressFamily::V4 => "ipv4",
             AddressFamily::V6 => "ipv6",
+            AddressFamily::V4V6 => "ipv4v6",
         }
     }
 
@@ -43,14 +51,17 @@ impl AddressFamily {
         match self {
             AddressFamily::V4 => 1,
             AddressFamily::V6 => 2,
+            AddressFamily::V4V6 => 3,
         }
     }
 
     /// `ip` 命令族参数：`-4` / `-6`。
+    ///
+    /// 双栈也按 IPv6 操作——IMS 信令只走 IPv6。
     pub fn ip_flag(self) -> &'static str {
         match self {
             AddressFamily::V4 => "-4",
-            AddressFamily::V6 => "-6",
+            AddressFamily::V6 | AddressFamily::V4V6 => "-6",
         }
     }
 }
