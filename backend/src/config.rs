@@ -1713,7 +1713,10 @@ fn default_data_enabled() -> bool {
 }
 
 fn default_apn_protocol() -> String {
-    "dual".to_string()
+    // 与本固件 netifd 侧 network.modem.iptype=ipv4 保持一致。
+    // 双栈（dual/ipv4v6）会在 wwan0 上额外装一条 metric 10 的 IPv6 默认路由，
+    // 实测会压过 IMS 承载的 IPv6 路由，得不偿失。
+    "ipv4".to_string()
 }
 
 fn default_apn_auth_method() -> String {
@@ -1741,7 +1744,10 @@ pub struct ApnConfig {
 impl Default for ApnConfig {
     fn default() -> Self {
         Self {
-            apn: String::new(),
+            // 首次运行写盘时就带上可用 APN：联通 WF2 出厂卡用 wonet。
+            // 其他运营商的卡由 modem_manager::default_apn_for_operator_code
+            // 按 IMSI/运营商码覆盖，这里只是兜底默认值。
+            apn: "wonet".to_string(),
             protocol: default_apn_protocol(),
             username: String::new(),
             password: String::new(),
