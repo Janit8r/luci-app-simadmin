@@ -2972,7 +2972,7 @@ LTE Timing Advance: 'unavailable'"#;
 
     #[test]
     fn maps_known_china_operator_codes_to_default_apn() {
-        assert_eq!(default_apn_for_operator_code("46001"), Some("3gnet"));
+        assert_eq!(default_apn_for_operator_code("46001"), Some("wonet"));
         assert_eq!(default_apn_for_operator_code("460-03"), Some("ctnet"));
         assert_eq!(default_apn_for_operator_code("460020"), Some("cmnet"));
         assert_eq!(default_apn_for_operator_code("00101"), None);
@@ -4095,7 +4095,9 @@ fn default_apn_for_operator_code(operator_code: &str) -> Option<&'static str> {
 
     match normalized {
         "46000" | "46002" | "46004" | "46007" | "46008" => Some("cmnet"),
-        "46001" | "46006" | "46009" => Some("3gnet"),
+        // 联通：wonet 是 4G/5G 通用 APN（3gnet 是 3G 时代的老 APN，
+        // 部分省份/套餐下会拿到受限地址段）。WF2 出厂卡实测 wonet 可用。
+        "46001" | "46006" | "46009" => Some("wonet"),
         "46003" | "46005" | "46011" => Some("ctnet"),
         "46015" => Some("cbnet"),
         _ => None,
